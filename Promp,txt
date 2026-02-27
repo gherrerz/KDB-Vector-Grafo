@@ -1,0 +1,64 @@
+Aquí tienes el prompt estructurado diseñado para recrear este proyecto desde cero utilizando una herramienta de IA (como ChatGPT, Claude, etc.) o para usarlo como guía paso a paso.
+
+Este prompt define el contexto, la arquitectura técnica (solucionando los conflictos de Pydantic) y el propósito del auditor técnico.
+
+Prompt de Recreación del Proyecto
+Título del Proyecto: Auditor Técnico de Base de Conocimientos (KDB)
+
+Objetivo: Crear una aplicación web interactiva utilizando Streamlit que permita subir documentos técnicos (PDFs, Excels), indexarlos en una base de datos vectorial (ChromaDB) y consultarlos mediante un agente inteligente (LangGraph) que cita fuentes y mantiene el contexto de la conversación.
+
+Tecnologías y Versiones Críticas (Estabilidad en Windows):
+
+Python 3.10+
+
+pydantic>=1.10.0,<2.0.0 (Obligatorio para compatibilidad con ChromaDB)
+
+chromadb==0.4.22
+
+langchain-chroma==0.1.4
+
+langgraph==0.1.15
+
+langchain-openai
+
+streamlit
+
+Estructura de Archivos a Crear:
+
+.env (Para la API KEY de OpenAI)
+
+requirements.txt (Para las dependencias)
+
+ingestion.py (Script de backend para cargar documentos)
+
+app.py (Interfaz de usuario y lógica del agente)
+
+Instrucciones detalladas para la IA:
+1. Configuración del Entorno (requirements.txt)
+Genera un archivo requirements.txt con las versiones fijadas arriba para asegurar la compatibilidad con Pydantic v1.
+
+2. Backend de Ingesta (ingestion.py)
+Crea una clase KDBIngestor que:
+
+Use PyPDFLoader y UnstructuredExcelLoader para cargar archivos desde una carpeta ./documentos_fuente.
+
+Particione el texto usando RecursiveCharacterTextSplitter.
+
+Genere embeddings usando OpenAIEmbeddings(model="text-embedding-3-small").
+
+Persista la base vectorial en ./db_chroma_kdb.
+
+3. Interfaz y Agente (app.py)
+Crea una aplicación de Streamlit que:
+
+Sidebar: Permita subir archivos y contenga un botón "🚀 Indexar Nueva Evidencia" que invoque a KDBIngestor.
+
+Agente: Utilice langgraph.prebuilt.create_react_agent con gpt-4o.
+
+Herramienta: Defina una herramienta funcional consultar_evidencia_kdb que use vector_store.similarity_search.
+
+Prompt del Sistema: Instruya al agente a responder en español, con rigor técnico, citar nombres de archivos y mantener honestidad sobre la falta de datos.
+
+Memoria: Implemente MemorySaver para mantener el hilo de la conversación.
+
+Con este prompt, cualquier asistente de IA podrá generarte el código necesario garantizando que la estructura de archivos y las dependencias sean correctas desde el primer intento.

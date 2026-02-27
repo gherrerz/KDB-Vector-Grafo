@@ -1,0 +1,21 @@
+# --- Core Dependencies ---
+pydantic>=1.10.0,<2.0.0
+typing-extensions>=4.2.0
+
+# --- Vector Database & AI Framework ---
+chromadb==0.4.22
+langchain-chroma==0.1.4
+langchain-openai
+langchain-core==0.2.33
+langgraph==0.1.15
+langchain
+
+# --- Data Loading & Processing ---
+# Nota: 'unstructured' puede requerir herramientas de compilación C++ en Windows
+unstructured[all-docs]
+pypdf
+openpyxl
+
+# --- Utilities & Frontend ---
+streamlit
+python-dotenv
