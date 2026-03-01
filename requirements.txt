@@ -1,21 +1,25 @@
+# Auditor KDB Pro - dependencies (stable tested combination)
+# pydantic 1.x + langchain 0.1.x compatible stack
+
 # --- Core Dependencies ---
 pydantic>=1.10.0,<2.0.0
+numpy>=1.24.0,<2.0.0
 typing-extensions>=4.2.0
+python-dotenv>=0.21.0
 
 # --- Vector Database & AI Framework ---
 chromadb==0.4.22
-langchain-chroma==0.1.4
-langchain-openai
-langchain-core==0.2.33
-langgraph==0.1.15
-langchain
+openai>=1.0.0
+neo4j>=5.0.0
+# removed langchain dependencies to simplify project
+# no langchain packages required
 
 # --- Data Loading & Processing ---
-# Nota: 'unstructured' puede requerir herramientas de compilación C++ en Windows
-unstructured[all-docs]
-pypdf
-openpyxl
+unstructured[all-docs]>=0.6.1
+pypdf>=3.0.0
+openpyxl>=3.0.10
 
 # --- Utilities & Frontend ---
-streamlit
-python-dotenv
+streamlit>=1.18.1
+
+# End of file

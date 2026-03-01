@@ -1,80 +1,230 @@
 import streamlit as st
 import os
-from ingestion import KDBIngestor  # Asegúrate de tener ingestion.py en la misma carpeta
+import re
+from ingestion import KDBIngestor
 from dotenv import load_dotenv
 
 # Cargar variables de entorno
 load_dotenv()
 
-# --- IMPORTS COMPATIBLES CON PYDANTIC V1 (Estabilidad garantizada) ---
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_chroma import Chroma
-from langgraph.prebuilt import create_react_agent
-# Tool tradicional de LangChain (compatible con Pydantic v1)
-from langchain.tools import Tool 
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage
+# --- IMPORTS ---
+import openai
+import chromadb
+from chromadb.utils import embedding_functions
+from neo4j import GraphDatabase
+# no langchain dependencies, use simple retrieval and OpenAI API
 
 # --- CONFIGURACIÓN DE RUTAS ---
 DATA_PATH = "./documentos_fuente"
 CHROMA_PATH = "./db_chroma_kdb"
 os.makedirs(DATA_PATH, exist_ok=True)
 
+NEO4J_URI = os.getenv("NEO4J_URI", "")
+NEO4J_USER = os.getenv("NEO4J_USER", "")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+
 # Configuración de página
 st.set_page_config(page_title="Auditor KDB Pro", layout="wide", page_icon="🕵️‍♂️")
 
-# --- INICIALIZACIÓN DE COMPONENTES (Cache con v1) ---
-@st.cache_resource
+# --- INICIALIZACIÓN DE COMPONENTES ---
 def init_vector_store():
-    # Asegúrate de tener OPENAI_API_KEY en tu archivo .env
     if not os.getenv("OPENAI_API_KEY"):
         st.error("❌ API Key no encontrada. Configura el archivo .env")
         st.stop()
-        
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    return Chroma(
-        persist_directory=CHROMA_PATH,
-        embedding_function=embeddings,
-        collection_name="kdb_principal"
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model_name="text-embedding-3-small"
     )
+    try:
+        return client.get_collection("kdb_principal", embedding_function=embedding_fn)
+    except ValueError:
+        # crear colección vacía si no existe (la ingesta se encargará de añadir embeddings)
+        return client.create_collection(name="kdb_principal", embedding_function=embedding_fn)
+
+
+def init_neo4j_driver():
+    if not (NEO4J_URI and NEO4J_USER and NEO4J_PASSWORD):
+        return None
+    try:
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        with driver.session(database=NEO4J_DATABASE) as session:
+            session.run("RETURN 1")
+        return driver
+    except Exception:
+        return None
 
 vector_store = init_vector_store()
+neo4j_driver = init_neo4j_driver()
 
-# --- DEFINICIÓN DEL AGENTE (LangGraph + Pydantic v1) ---
-llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
+# --- DEFINICIÓN DE AYUDA SIMPLE ---
+# No usamos agentes: hacemos búsqueda y consulta directa con OpenAI
 
-# Función de búsqueda de la herramienta (compatible v1)
-def consultar_evidencia_kdb(query: str) -> str:
-    """Busca información técnica en los documentos, tablas de Excel y reportes auditados."""
-    docs = vector_store.similarity_search(query, k=5)
-    return "\n\n".join([d.page_content for d in docs])
+# initialize OpenAI client (new 1.0+ interface)
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Tool tradicional
-retriever_tool = Tool(
-    name="consultar_evidencia_kdb",
-    func=consultar_evidencia_kdb,
-    description="Busca información técnica en los documentos para responder preguntas de auditoría."
-)
+system_prompt = """Eres un Auditor Técnico experto y Analista de Datos. Tu objetivo es analizar la base de conocimientos proporcionada.
 
-system_message = """Eres un Auditor Técnico experto y Analista de Datos. Tu objetivo es analizar la base de conocimientos proporcionada.
 REGLAS DE ORO:
 1. IDIOMA: Responde siempre en ESPAÑOL profesional.
 2. RIGOR: Si los datos provienen de una tabla, interprétalos con precisión quirúrgica.
 3. CITACIÓN: Menciona siempre el nombre del archivo fuente (p.ej., 'Según reporte_final.pdf, página 4...').
-4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos, di: 'No se encontraron registros suficientes para validar esta información'."""
+4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos, di: 'No se encontraron registros suficientes para validar esta información'.
+"""
 
-# Crear el Agente con compatibilidad Pydantic v1
-# MemorySaver permite que recuerde la conversación anterior en esta sesión
-agent_executor = create_react_agent(
-    llm, 
-    tools=[retriever_tool],
-    state_modifier=system_message,
-    checkpointer=MemorySaver()
-)
+def consultar_evidencia_kdb(query: str) -> list[dict]:
+    """Busca en ChromaDB, devuelve metadatos y texto."""
+    try:
+        results = vector_store.query(
+            query_texts=[query],
+            n_results=5
+        )
+        docs = []
+        for i, text in enumerate(results.get("documents", [[]])[0]):
+            docs.append({
+                "text": text,
+                "source": results.get("metadatas", [[{}]])[0][i].get("source", "")
+            })
+        return docs
+    except Exception:
+        return []
+
+
+def _extraer_keywords(query: str) -> list[str]:
+    tokens = re.findall(r"[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]{4,}", query.lower())
+    stopwords = {
+        "para", "como", "esta", "este", "estos", "estas", "sobre", "entre",
+        "donde", "desde", "hasta", "tambien", "segun", "datos", "evidencia",
+        "validacion", "estructura", "semantica", "documento", "documentos"
+    }
+    filtered = [t for t in tokens if t not in stopwords]
+    unique = []
+    for t in filtered:
+        if t not in unique:
+            unique.append(t)
+    return unique[:8]
+
+
+def consultar_evidencia_grafo(query: str, limit: int = 5) -> list[dict]:
+    if neo4j_driver is None:
+        return []
+
+    keywords = _extraer_keywords(query)
+    if not keywords:
+        return []
+
+    cypher = """
+    MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+    WHERE any(k IN $keywords WHERE toLower(c.text) CONTAINS k)
+    WITH d, c,
+         reduce(score = 0, k IN $keywords |
+            score + CASE WHEN toLower(c.text) CONTAINS k THEN 1 ELSE 0 END
+         ) AS score
+    OPTIONAL MATCH (prev:Chunk)-[:NEXT]->(c)
+    OPTIONAL MATCH (c)-[:NEXT]->(nxt:Chunk)
+    RETURN d.name AS source,
+           c.text AS text,
+           c.position AS position,
+           score,
+           prev.text AS prev_text,
+           nxt.text AS next_text
+    ORDER BY score DESC, position ASC
+    LIMIT $limit
+    """
+
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            rows = session.run(cypher, keywords=keywords, limit=limit)
+            docs = []
+            for row in rows:
+                docs.append({
+                    "text": row.get("text", ""),
+                    "source": row.get("source", ""),
+                    "position": row.get("position", 0),
+                    "score": row.get("score", 0),
+                    "prev_text": row.get("prev_text", ""),
+                    "next_text": row.get("next_text", "")
+                })
+            return docs
+    except Exception:
+        return []
+
+
+def recuperar_evidencia_hibrida(query: str) -> dict:
+    evidencia_vector = consultar_evidencia_kdb(query)
+    evidencia_grafo = consultar_evidencia_grafo(query)
+
+    combined = []
+    seen = set()
+    for item in evidencia_vector:
+        key = (item.get("source", ""), item.get("text", "")[:200])
+        if key not in seen:
+            combined.append(item)
+            seen.add(key)
+
+    for item in evidencia_grafo:
+        key = (item.get("source", ""), item.get("text", "")[:200])
+        if key not in seen:
+            combined.append({"source": item.get("source", ""), "text": item.get("text", "")})
+            seen.add(key)
+
+    return {
+        "vector": evidencia_vector,
+        "graph": evidencia_grafo,
+        "combined": combined
+    }
+
+
+def generar_respuesta(user_question: str) -> str:
+    evidencia = recuperar_evidencia_hibrida(user_question)
+
+    evidencia_semantica = "\n\n".join(
+        [f"Fuente: {d['source']}\n{d['text']}" for d in evidencia["vector"]]
+    )
+
+    evidencia_estructural = "\n\n".join([
+        (
+            f"Fuente: {d['source']} | Posición: {d.get('position', 0)} | Score estructural: {d.get('score', 0)}\n"
+            f"Previo: {d.get('prev_text', '')}\n"
+            f"Actual: {d.get('text', '')}\n"
+            f"Siguiente: {d.get('next_text', '')}"
+        )
+        for d in evidencia["graph"]
+    ])
+
+    if not evidencia_semantica:
+        evidencia_semantica = "No se recuperó evidencia semántica en ChromaDB."
+    if not evidencia_estructural:
+        evidencia_estructural = "No se recuperó evidencia estructural en Neo4j."
+
+    prompt = (
+        f"{system_prompt}\n\n"
+        "VALIDA LA RESPUESTA CON DOS CAPAS:\n"
+        "1) Semántica (similitud vectorial)\n"
+        "2) Estructural (posición y continuidad del chunk en grafo)\n\n"
+        f"EVIDENCIA SEMÁNTICA:\n{evidencia_semantica}\n\n"
+        f"EVIDENCIA ESTRUCTURAL:\n{evidencia_estructural}\n\n"
+        f"PREGUNTA:\n{user_question}"
+    )
+    # use new OpenAI chat API (v1.0+)
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0
+    )
+    return resp.choices[0].message.content.strip()
 
 # --- INTERFAZ DE USUARIO (SIDEBAR) ---
 with st.sidebar:
     st.header("📥 Ingesta de Evidencia")
+    if neo4j_driver is None:
+        st.warning("Neo4j no configurado. El sistema funcionará en modo vectorial.")
+    else:
+        st.success("Neo4j conectado. Validación estructural habilitada.")
     files = st.file_uploader("Subir archivos (PDF, Excel)", accept_multiple_files=True)
     
     if st.button("🚀 Indexar Nueva Evidencia"):
@@ -85,9 +235,8 @@ with st.sidebar:
                     with open(file_path, "wb") as buffer:
                         buffer.write(f.getbuffer())
                 
-                st.write("Analizando contenido y generando embeddings (ChromaDB)...")
+                st.write("Analizando contenido y generando embeddings + grafo (ChromaDB + Neo4j)...")
                 
-                # Llama a la clase KDBIngestor importada de ingestion.py
                 ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH)
                 ingestor.run()
                 
@@ -102,9 +251,9 @@ with st.sidebar:
 
 # --- PANEL DE CHAT ---
 st.title("🕵️‍♂️ Panel de Auditoría Inteligente")
-st.caption("Motor: LangGraph | Vector DB: ChromaDB | Pydantic: v1")
+st.caption("Motor: OpenAI | RAG Híbrido: ChromaDB (semántico) + Neo4j (estructural)")
 
-# Inicializar historial visual si no existe
+# Inicializar historial
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Listo para auditar. Sube tus archivos en la barra lateral para comenzar."}]
 
@@ -115,26 +264,16 @@ for msg in st.session_state.messages:
 
 # Capturar nueva consulta
 if user_input := st.chat_input("Consulta la base de conocimientos..."):
-    # Guardar y mostrar pregunta del usuario
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Procesar respuesta del Auditor
+    # Procesar respuesta del Auditor usando el generador simple
     with st.chat_message("assistant"):
         with st.spinner("El Auditor está analizando la evidencia..."):
-            
-            # Configuración para que LangGraph mantenga el hilo de conversación
-            config = {"configurable": {"thread_id": "auditoria_sesion_001"}}
-            
-            # Ejecución del agente con la pregunta
-            result = agent_executor.invoke(
-                {"messages": [HumanMessage(content=user_input)]}, 
-                config
-            )
-            
-            # Obtener el último mensaje generado por el agente
-            response_text = result["messages"][-1].content
-            
+            try:
+                response_text = generar_respuesta(user_input)
+            except Exception as e:
+                response_text = f"❌ Error al generar respuesta: {str(e)}"
             st.markdown(response_text)
             st.session_state.messages.append({"role": "assistant", "content": response_text})
