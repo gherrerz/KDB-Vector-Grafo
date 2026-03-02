@@ -1,6 +1,10 @@
 import streamlit as st
 import os
 import re
+import io
+import shutil
+import zipfile
+import gc
 from ingestion import KDBIngestor
 from dotenv import load_dotenv
 
@@ -29,6 +33,141 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 # Configuración de página
 st.set_page_config(page_title="Auditor KDB Pro", layout="wide", page_icon="🕵️‍♂️")
+
+
+def _copiar_carpeta_recursiva(origen: str, destino_base: str) -> int:
+    origen_abs = os.path.abspath(origen)
+    destino_abs = os.path.abspath(destino_base)
+
+    if not os.path.isdir(origen_abs):
+        raise ValueError(f"La ruta no es una carpeta válida: {origen}")
+
+    if origen_abs == destino_abs or origen_abs.startswith(destino_abs + os.sep):
+        raise ValueError("La carpeta origen no puede estar dentro de documentos_fuente.")
+
+    base_name = os.path.basename(origen_abs.rstrip("\\/"))
+    copied = 0
+
+    for root, _, files in os.walk(origen_abs):
+        rel = os.path.relpath(root, origen_abs)
+        for file_name in files:
+            src = os.path.join(root, file_name)
+            if rel == ".":
+                rel_target = os.path.join(base_name, file_name)
+            else:
+                rel_target = os.path.join(base_name, rel, file_name)
+            dst = os.path.join(destino_base, rel_target)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+
+    return copied
+
+
+def _extraer_zip_recursivo(uploaded_file, destino_base: str) -> int:
+    data = uploaded_file.getvalue()
+    extracted = 0
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+
+            normalized = os.path.normpath(member.filename).replace("\\", "/")
+            parts = [p for p in normalized.split("/") if p not in ("", ".")]
+            if not parts or ".." in parts:
+                continue
+
+            dst = os.path.join(destino_base, *parts)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+            with zf.open(member, "r") as src_stream, open(dst, "wb") as dst_stream:
+                shutil.copyfileobj(src_stream, dst_stream)
+            extracted += 1
+
+    return extracted
+
+
+def _limpiar_directorio(path: str):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+        return
+
+    for name in os.listdir(path):
+        target = os.path.join(path, name)
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            try:
+                os.remove(target)
+            except FileNotFoundError:
+                pass
+
+
+def _reset_neo4j():
+    if neo4j_driver is None:
+        return False
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            session.run("MATCH (n) DETACH DELETE n")
+        return True
+    except Exception:
+        return False
+
+
+def _reset_chroma_collections() -> int:
+    global vector_stores
+    if chroma_client is None:
+        return 0
+
+    deleted = 0
+    try:
+        existing = chroma_client.list_collections()
+    except Exception:
+        return 0
+
+    for item in existing:
+        name = getattr(item, "name", None)
+        if not name:
+            continue
+        if not name.startswith("kdb_"):
+            continue
+        try:
+            chroma_client.delete_collection(name)
+            deleted += 1
+        except Exception:
+            continue
+
+    vector_stores = {}
+    return deleted
+
+
+def _limpieza_profunda_chroma() -> tuple[bool, str]:
+    global chroma_client, vector_stores
+    mensaje = ""
+
+    try:
+        _reset_chroma_collections()
+    except Exception:
+        pass
+
+    vector_stores = {}
+    chroma_client = None
+    gc.collect()
+
+    try:
+        if os.path.exists(CHROMA_PATH):
+            shutil.rmtree(CHROMA_PATH)
+        os.makedirs(CHROMA_PATH, exist_ok=True)
+        return True, "db_chroma_kdb borrado y recreado"
+    except Exception as e:
+        mensaje = (
+            "Windows mantiene lock sobre chroma.sqlite3. "
+            "Cierra la app y ejecuta: "
+            "Remove-Item .\\db_chroma_kdb -Recurse -Force; "
+            "New-Item .\\db_chroma_kdb -ItemType Directory"
+        )
+        return False, f"{mensaje}. Detalle: {e}"
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
 def init_vector_stores():
@@ -63,7 +202,7 @@ def init_vector_stores():
             embedding_function=embedding_fn
         )
 
-    return collections
+    return client, collections
 
 
 def init_neo4j_driver():
@@ -77,7 +216,7 @@ def init_neo4j_driver():
     except Exception:
         return None
 
-vector_stores = init_vector_stores()
+chroma_client, vector_stores = init_vector_stores()
 neo4j_driver = init_neo4j_driver()
 
 # --- DEFINICIÓN DE AYUDA SIMPLE ---
@@ -316,7 +455,15 @@ with st.sidebar:
         st.warning("Neo4j no configurado. El sistema funcionará en modo vectorial.")
     else:
         st.success("Neo4j conectado. Validación estructural habilitada.")
-    files = st.file_uploader("Subir archivos (PDF, Excel)", accept_multiple_files=True)
+    files = st.file_uploader(
+        "Browse files (archivos o .zip de carpeta)",
+        accept_multiple_files=True,
+        type=["pdf", "xlsx", "xls", "zip", "txt", "md", "py", "js", "ts", "java", "json", "yml", "yaml"]
+    )
+    carpeta_local = st.text_input(
+        "Ruta de carpeta local (opcional, carga recursiva)",
+        placeholder=r"C:\ruta\a\mi\repositorio"
+    )
 
     st.subheader("🔎 Filtros de búsqueda")
     selected_strategy = st.selectbox(
@@ -330,14 +477,81 @@ with st.sidebar:
         collection_options,
         index=0
     )
+
+    if st.button("🧹 Limpiar fuente e índices"):
+        with st.status("Limpiando datos previos...", expanded=True) as status:
+            try:
+                _limpiar_directorio(DATA_PATH)
+                st.write("🧼 documentos_fuente limpiado")
+
+                deleted_collections = _reset_chroma_collections()
+                st.write(f"🧼 Chroma limpiado ({deleted_collections} colecciones)")
+
+                neo4j_cleaned = _reset_neo4j()
+                if neo4j_cleaned:
+                    st.write("🕸️ Neo4j limpiado")
+                else:
+                    st.write("ℹ️ Neo4j no estaba disponible o no se pudo limpiar")
+
+                status.update(label="✅ Limpieza completa", state="complete")
+                st.success("Base limpia. Ya puedes cargar nueva evidencia sin duplicados.")
+                st.rerun()
+            except Exception as e:
+                status.update(label="⚠️ Limpieza incompleta", state="error")
+                st.error(f"No se pudo completar la limpieza: {e}")
+
+    if st.button("🧨 Limpieza profunda (reinicio de DB)"):
+        with st.status("Ejecutando limpieza profunda...", expanded=True) as status:
+            try:
+                _limpiar_directorio(DATA_PATH)
+                st.write("🧼 documentos_fuente limpiado")
+
+                deep_ok, deep_msg = _limpieza_profunda_chroma()
+                if deep_ok:
+                    st.write("🧼 Chroma físico reiniciado")
+                else:
+                    st.write("⚠️ No se pudo borrar físicamente la DB en caliente")
+
+                neo4j_cleaned = _reset_neo4j()
+                if neo4j_cleaned:
+                    st.write("🕸️ Neo4j limpiado")
+                else:
+                    st.write("ℹ️ Neo4j no estaba disponible o no se pudo limpiar")
+
+                if deep_ok:
+                    status.update(label="✅ Limpieza profunda completa", state="complete")
+                    st.success("Limpieza profunda completada.")
+                    st.rerun()
+                else:
+                    status.update(label="⚠️ Limpieza profunda parcial", state="error")
+                    st.warning(deep_msg)
+            except Exception as e:
+                status.update(label="⚠️ Limpieza profunda incompleta", state="error")
+                st.error(f"No se pudo completar la limpieza profunda: {e}")
     
     if st.button("🚀 Indexar Nueva Evidencia"):
-        if files:
+        if files or carpeta_local.strip():
             with st.status("Procesando...", expanded=True) as status:
-                for f in files:
-                    file_path = os.path.join(DATA_PATH, f.name)
-                    with open(file_path, "wb") as buffer:
-                        buffer.write(f.getbuffer())
+                total_copiados = 0
+
+                for f in files or []:
+                    if f.name.lower().endswith(".zip"):
+                        count = _extraer_zip_recursivo(f, DATA_PATH)
+                        total_copiados += count
+                        st.write(f"📦 ZIP extraído: {f.name} ({count} archivos)")
+                    else:
+                        file_path = os.path.join(DATA_PATH, f.name)
+                        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                        with open(file_path, "wb") as buffer:
+                            buffer.write(f.getbuffer())
+                        total_copiados += 1
+
+                if carpeta_local.strip():
+                    count = _copiar_carpeta_recursiva(carpeta_local.strip(), DATA_PATH)
+                    total_copiados += count
+                    st.write(f"📁 Carpeta copiada recursivamente ({count} archivos)")
+
+                st.write(f"📚 Archivos listos para indexar: {total_copiados}")
                 
                 st.write("Analizando contenido y generando embeddings + grafo (ChromaDB + Neo4j)...")
                 
@@ -347,6 +561,8 @@ with st.sidebar:
                 status.update(label="✅ KDB Actualizada", state="complete")
             st.success("Archivos listos para auditoría")
             st.rerun()
+        else:
+            st.warning("Sube archivos/.zip o indica una carpeta local para indexar.")
 
     st.divider()
     if st.button("🗑️ Limpiar Historial de Chat"):
