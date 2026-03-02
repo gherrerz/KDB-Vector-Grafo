@@ -31,6 +31,8 @@ class KDBIngestor:
         # simple splitting helper: chunks of specified size with overlap
         self.chunk_size = 1000
         self.chunk_overlap = 200
+        self.max_batch_tokens = 120000
+        self.max_batch_items = 100
 
         self.neo4j_uri = os.getenv("NEO4J_URI", "")
         self.neo4j_user = os.getenv("NEO4J_USER", "")
@@ -143,6 +145,56 @@ class KDBIngestor:
         if self.neo4j_driver:
             self.neo4j_driver.close()
 
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        # Estimación conservadora (aprox. 1 token cada 4 caracteres)
+        return max(1, len(text) // 4)
+
+    def _upsert_in_batches(self, collection, texts, metadatas, ids):
+        batch_texts = []
+        batch_metadatas = []
+        batch_ids = []
+        batch_tokens = 0
+        total = len(texts)
+        inserted = 0
+
+        def flush_batch():
+            nonlocal batch_texts, batch_metadatas, batch_ids, batch_tokens, inserted
+            if not batch_texts:
+                return
+            collection.upsert(
+                documents=batch_texts,
+                metadatas=batch_metadatas,
+                ids=batch_ids
+            )
+            inserted += len(batch_texts)
+            print(f"   ↳ Upsert batch OK: {inserted}/{total} chunks")
+            batch_texts = []
+            batch_metadatas = []
+            batch_ids = []
+            batch_tokens = 0
+
+        for text, metadata, doc_id in zip(texts, metadatas, ids):
+            item_tokens = self._estimate_tokens(text)
+
+            if item_tokens > self.max_batch_tokens:
+                print(f"⚠️ Chunk muy grande ({item_tokens} tokens est.). Se omite id={doc_id}")
+                continue
+
+            would_exceed_tokens = (batch_tokens + item_tokens) > self.max_batch_tokens
+            would_exceed_items = len(batch_texts) >= self.max_batch_items
+
+            if would_exceed_tokens or would_exceed_items:
+                flush_batch()
+
+            batch_texts.append(text)
+            batch_metadatas.append(metadata)
+            batch_ids.append(doc_id)
+            batch_tokens += item_tokens
+
+        flush_batch()
+
     def load_documents(self):
         """Carga y procesa documentos de diferentes formatos."""
         documents = []
@@ -221,7 +273,7 @@ class KDBIngestor:
         texts = [d.get("page_content", "") for d in docs]
         metadatas = [{"source": d.get("metadata", {}).get("source", "")} for d in docs]
         ids = [f"{d.get('metadata', {}).get('graph_chunk_id', uuid.uuid4().hex)}::{uuid.uuid4().hex[:8]}" for d in docs]
-        collection.upsert(documents=texts, metadatas=metadatas, ids=ids)
+        self._upsert_in_batches(collection, texts, metadatas, ids)
 
         # 4. Indexar estructura documental en Neo4j
         self._index_graph(docs)
