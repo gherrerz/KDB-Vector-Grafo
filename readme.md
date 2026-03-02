@@ -12,6 +12,7 @@ El sistema responde en español, cita fuentes y mantiene trazabilidad basada en 
 ## ✅ Funcionalidades
 
 - Ingesta de documentos `.pdf`, `.xlsx`, `.xls`
+- Ingesta recursiva de texto y código fuente (`.py`, `.js`, `.ts`, `.java`, `.md`, `.txt`, etc.)
 - Fragmentación de texto en chunks con solapamiento
 - Indexación semántica en ChromaDB
 - Indexación estructural en Neo4j con:
@@ -26,6 +27,7 @@ El sistema responde en español, cita fuentes y mantiene trazabilidad basada en 
 ### 1) Ingesta (`ingestion.py`)
 
 1. Carga documentos desde `./documentos_fuente`
+   - Incluye subcarpetas (útil para repositorios completos)
 2. Divide texto en chunks
 3. Hace `upsert` en colección ChromaDB `kdb_principal`
 4. Construye/actualiza grafo en Neo4j:
@@ -96,6 +98,88 @@ sequenceDiagram
    O-->>S: Respuesta auditada
    S-->>U: Respuesta con citas
 ```
+
+---
+
+## ✂️ Estrategias de chunking (solo descomentando)
+
+En `ingestion.py`, dentro de `KDBIngestor.__init__`, deja activa **solo una** de estas líneas:
+
+```python
+self.chunk_strategy = "char_overlap"
+# self.chunk_strategy = "sentence_window"
+# self.chunk_strategy = "paragraph_window"
+# self.chunk_strategy = "heading_window"
+# self.chunk_strategy = "code_aware"
+```
+
+Opciones disponibles:
+
+- `char_overlap` (actual por defecto): chunks por tamaño fijo + overlap.
+- `sentence_window`: ventanas por oraciones con solapamiento semántico.
+- `paragraph_window`: ventanas por párrafos (mejor para informes/tablas narradas).
+- `heading_window`: prioriza secciones por encabezados (Markdown o títulos numerados).
+- `code_aware`: intenta separar por bloques de código (funciones/clases) y luego ventana por líneas.
+
+Parámetros que puedes ajustar en el mismo `__init__`:
+
+- `chunk_size`, `chunk_overlap`
+- `sentence_window_size`, `sentence_overlap`
+- `paragraph_window_size`, `paragraph_overlap`
+- `code_line_window`, `code_line_overlap`
+
+---
+
+## 🧠 Multi-colección / Multi-vector (implementado)
+
+La ingesta ahora puede guardar embeddings en **múltiples colecciones** con diferentes estrategias de chunking en una sola corrida:
+
+- `kdb_small`: chunks pequeños orientados a precisión semántica.
+- `kdb_large`: chunks grandes orientados a más contexto (perfil principal para grafo).
+- `kdb_code`: chunks orientados a código (`code_aware`).
+
+Configuración en `ingestion.py`:
+
+```python
+self.enable_multi_collection = True
+# self.enable_multi_collection = False
+```
+
+Si `False`, vuelve al modo clásico con una sola colección (`kdb_principal`) usando `self.chunk_strategy`.
+
+Además, cada vector guarda metadatos para filtrar búsquedas:
+
+- `source`
+- `file_type`
+- `chunk_strategy`
+- `collection`
+- `parent_id` (vincula multi-vector del mismo documento base)
+- `position`
+
+---
+
+## 🔎 Filtros en consulta (UI)
+
+En el sidebar de `app.py` ahora puedes filtrar recuperación vectorial por:
+
+- **Estrategia de chunk** (`all`, `char_overlap`, `sentence_window`, etc.)
+- **Colección** (`all`, `kdb_small`, `kdb_large`, `kdb_code`, etc.)
+
+La app consulta una o varias colecciones, combina resultados y deduplica por `parent_id`.
+
+---
+
+## 💻 Repositorios de código + documentación
+
+Para que el sistema lea, guarde y entienda código fuente junto con documentación:
+
+1. Copia el repo (o carpeta del repo) dentro de `./documentos_fuente/`.
+2. Ejecuta **Indexar Nueva Evidencia** en la app.
+3. Recomendación de estrategia:
+   - Código: `code_aware`
+   - Documentación técnica (`README`, specs): `heading_window` o `paragraph_window`
+
+Tip práctico: si vas a indexar mezcla de código + docs en una sola corrida, empieza con `code_aware` y luego prueba `heading_window` para comparar calidad de respuesta.
 
 ---
 

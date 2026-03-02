@@ -19,6 +19,9 @@ DATA_PATH = "./documentos_fuente"
 CHROMA_PATH = "./db_chroma_kdb"
 os.makedirs(DATA_PATH, exist_ok=True)
 
+DEFAULT_COLLECTIONS = ["kdb_principal", "kdb_small", "kdb_large", "kdb_code"]
+STRATEGY_OPTIONS = ["all", "char_overlap", "sentence_window", "paragraph_window", "heading_window", "code_aware"]
+
 NEO4J_URI = os.getenv("NEO4J_URI", "")
 NEO4J_USER = os.getenv("NEO4J_USER", "")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
@@ -28,7 +31,7 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 st.set_page_config(page_title="Auditor KDB Pro", layout="wide", page_icon="🕵️‍♂️")
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
-def init_vector_store():
+def init_vector_stores():
     if not os.getenv("OPENAI_API_KEY"):
         st.error("❌ API Key no encontrada. Configura el archivo .env")
         st.stop()
@@ -37,11 +40,30 @@ def init_vector_store():
         api_key=os.getenv("OPENAI_API_KEY"),
         model_name="text-embedding-3-small"
     )
+    collection_names = set(DEFAULT_COLLECTIONS)
     try:
-        return client.get_collection("kdb_principal", embedding_function=embedding_fn)
-    except ValueError:
-        # crear colección vacía si no existe (la ingesta se encargará de añadir embeddings)
-        return client.create_collection(name="kdb_principal", embedding_function=embedding_fn)
+        existing = client.list_collections()
+        for item in existing:
+            name = getattr(item, "name", None)
+            if name and name.startswith("kdb_"):
+                collection_names.add(name)
+    except Exception:
+        pass
+
+    collections = {}
+    for name in sorted(collection_names):
+        try:
+            collections[name] = client.get_collection(name, embedding_function=embedding_fn)
+        except Exception:
+            continue
+
+    if not collections:
+        collections["kdb_principal"] = client.create_collection(
+            name="kdb_principal",
+            embedding_function=embedding_fn
+        )
+
+    return collections
 
 
 def init_neo4j_driver():
@@ -55,7 +77,7 @@ def init_neo4j_driver():
     except Exception:
         return None
 
-vector_store = init_vector_store()
+vector_stores = init_vector_stores()
 neo4j_driver = init_neo4j_driver()
 
 # --- DEFINICIÓN DE AYUDA SIMPLE ---
@@ -73,22 +95,69 @@ REGLAS DE ORO:
 4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos, di: 'No se encontraron registros suficientes para validar esta información'.
 """
 
-def consultar_evidencia_kdb(query: str) -> list[dict]:
-    """Busca en ChromaDB, devuelve metadatos y texto."""
-    try:
-        results = vector_store.query(
-            query_texts=[query],
-            n_results=5
-        )
-        docs = []
-        for i, text in enumerate(results.get("documents", [[]])[0]):
-            docs.append({
-                "text": text,
-                "source": results.get("metadatas", [[{}]])[0][i].get("source", "")
-            })
-        return docs
-    except Exception:
+def consultar_evidencia_kdb(
+    query: str,
+    strategy_filter: str = "all",
+    collection_filter: str = "all",
+    per_collection_k: int = 4
+) -> list[dict]:
+    """Busca en una o varias colecciones ChromaDB y permite filtrar por metadatos."""
+    if not vector_stores:
         return []
+
+    if collection_filter != "all" and collection_filter in vector_stores:
+        target_collections = {collection_filter: vector_stores[collection_filter]}
+    elif collection_filter == "all":
+        target_collections = vector_stores
+    else:
+        return []
+
+    where = None
+    if strategy_filter != "all":
+        where = {"chunk_strategy": strategy_filter}
+
+    all_docs = []
+    for collection_name, collection in target_collections.items():
+        try:
+            query_args = {
+                "query_texts": [query],
+                "n_results": per_collection_k
+            }
+            if where:
+                query_args["where"] = where
+
+            results = collection.query(**query_args)
+            documents = results.get("documents", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+            for i, text in enumerate(documents):
+                metadata = metadatas[i] if i < len(metadatas) else {}
+                distance = distances[i] if i < len(distances) else None
+                all_docs.append({
+                    "text": text,
+                    "source": metadata.get("source", ""),
+                    "collection": metadata.get("collection", collection_name),
+                    "chunk_strategy": metadata.get("chunk_strategy", ""),
+                    "parent_id": metadata.get("parent_id", ""),
+                    "file_type": metadata.get("file_type", ""),
+                    "distance": distance
+                })
+        except Exception:
+            continue
+
+    all_docs = sorted(all_docs, key=lambda x: x.get("distance") if x.get("distance") is not None else 999)
+
+    deduped = []
+    seen = set()
+    for d in all_docs:
+        key = d.get("parent_id") or (d.get("source", ""), d.get("text", "")[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(d)
+
+    return deduped[:8]
 
 
 def _extraer_keywords(query: str) -> list[str]:
@@ -151,8 +220,16 @@ def consultar_evidencia_grafo(query: str, limit: int = 5) -> list[dict]:
         return []
 
 
-def recuperar_evidencia_hibrida(query: str) -> dict:
-    evidencia_vector = consultar_evidencia_kdb(query)
+def recuperar_evidencia_hibrida(
+    query: str,
+    strategy_filter: str = "all",
+    collection_filter: str = "all"
+) -> dict:
+    evidencia_vector = consultar_evidencia_kdb(
+        query,
+        strategy_filter=strategy_filter,
+        collection_filter=collection_filter
+    )
     evidencia_grafo = consultar_evidencia_grafo(query)
 
     combined = []
@@ -176,11 +253,25 @@ def recuperar_evidencia_hibrida(query: str) -> dict:
     }
 
 
-def generar_respuesta(user_question: str) -> str:
-    evidencia = recuperar_evidencia_hibrida(user_question)
+def generar_respuesta(
+    user_question: str,
+    strategy_filter: str = "all",
+    collection_filter: str = "all"
+) -> str:
+    evidencia = recuperar_evidencia_hibrida(
+        user_question,
+        strategy_filter=strategy_filter,
+        collection_filter=collection_filter
+    )
 
     evidencia_semantica = "\n\n".join(
-        [f"Fuente: {d['source']}\n{d['text']}" for d in evidencia["vector"]]
+        [
+            (
+                f"Fuente: {d['source']} | Colección: {d.get('collection', '')} | "
+                f"Estrategia: {d.get('chunk_strategy', '')}\n{d['text']}"
+            )
+            for d in evidencia["vector"]
+        ]
     )
 
     evidencia_estructural = "\n\n".join([
@@ -226,6 +317,19 @@ with st.sidebar:
     else:
         st.success("Neo4j conectado. Validación estructural habilitada.")
     files = st.file_uploader("Subir archivos (PDF, Excel)", accept_multiple_files=True)
+
+    st.subheader("🔎 Filtros de búsqueda")
+    selected_strategy = st.selectbox(
+        "Estrategia de chunk",
+        STRATEGY_OPTIONS,
+        index=0
+    )
+    collection_options = ["all"] + sorted(vector_stores.keys())
+    selected_collection = st.selectbox(
+        "Colección",
+        collection_options,
+        index=0
+    )
     
     if st.button("🚀 Indexar Nueva Evidencia"):
         if files:
@@ -272,7 +376,11 @@ if user_input := st.chat_input("Consulta la base de conocimientos..."):
     with st.chat_message("assistant"):
         with st.spinner("El Auditor está analizando la evidencia..."):
             try:
-                response_text = generar_respuesta(user_input)
+                response_text = generar_respuesta(
+                    user_input,
+                    strategy_filter=selected_strategy,
+                    collection_filter=selected_collection
+                )
             except Exception as e:
                 response_text = f"❌ Error al generar respuesta: {str(e)}"
             st.markdown(response_text)
