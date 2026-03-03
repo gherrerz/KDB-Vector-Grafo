@@ -77,8 +77,9 @@ class KDBIngestor:
         self.code_line_window = 80
         self.code_line_overlap = 20
 
-        self.max_batch_tokens = 120000
+        self.max_batch_tokens = 7000
         self.max_batch_items = 100
+        self.max_embedding_tokens = 8000
 
         self.text_extensions = {
             ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".json", ".yaml", ".yml"
@@ -205,6 +206,32 @@ class KDBIngestor:
         # Estimación conservadora (aprox. 1 token cada 4 caracteres)
         return max(1, len(text) // 4)
 
+    def _split_char_overlap_with_params(self, text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+        if not text:
+            return []
+        chunks = []
+        start = 0
+        safe_chunk_size = max(1, chunk_size)
+        safe_overlap = max(0, min(chunk_overlap, safe_chunk_size - 1))
+        step = max(1, safe_chunk_size - safe_overlap)
+        while start < len(text):
+            end = min(len(text), start + safe_chunk_size)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start += step
+        return chunks
+
+    def _enforce_embedding_token_limit(self, text: str) -> list[str]:
+        if not text:
+            return []
+        if self._estimate_tokens(text) <= self.max_embedding_tokens:
+            return [text]
+
+        max_chars = self.max_embedding_tokens * 4
+        safe_overlap = min(self.chunk_overlap, max_chars // 5)
+        return self._split_char_overlap_with_params(text, max_chars, safe_overlap)
+
     def _upsert_in_batches(self, collection, texts, metadatas, ids):
         batch_texts = []
         batch_metadatas = []
@@ -290,18 +317,7 @@ class KDBIngestor:
         return uuid.uuid5(uuid.NAMESPACE_URL, fingerprint).hex
 
     def _split_char_overlap(self, text: str) -> list[str]:
-        if not text:
-            return []
-        chunks = []
-        start = 0
-        step = max(1, self.chunk_size - self.chunk_overlap)
-        while start < len(text):
-            end = min(len(text), start + self.chunk_size)
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-            start += step
-        return chunks
+        return self._split_char_overlap_with_params(text, self.chunk_size, self.chunk_overlap)
 
     def _split_sentence_window(self, text: str) -> list[str]:
         if not text:
@@ -405,7 +421,10 @@ class KDBIngestor:
                 line_end = min(len(block_lines), line_start + self.code_line_window)
                 piece = "\n".join(block_lines[line_start:line_end]).strip()
                 if piece:
-                    chunks.append(piece)
+                    if len(piece) <= self.chunk_size:
+                        chunks.append(piece)
+                    else:
+                        chunks.extend(self._split_char_overlap(piece))
                 line_start += line_step
         return chunks
 
@@ -437,19 +456,21 @@ class KDBIngestor:
 
             chunks = self._split_text(text)
             for chunk in chunks:
-                position = source_positions[source]
-                graph_chunk_id = f"{source_id}::{position}"
-                parent_id = f"{source_id}::raw::{raw_idx}"
-                metadata = {
-                    **metadata_base,
-                    "position": position,
-                    "graph_chunk_id": graph_chunk_id,
-                    "chunk_strategy": self.chunk_strategy,
-                    "collection": collection_name,
-                    "parent_id": parent_id
-                }
-                docs.append({"page_content": chunk, "metadata": metadata})
-                source_positions[source] += 1
+                safe_chunks = self._enforce_embedding_token_limit(chunk)
+                for safe_chunk in safe_chunks:
+                    position = source_positions[source]
+                    graph_chunk_id = f"{source_id}::{position}"
+                    parent_id = f"{source_id}::raw::{raw_idx}"
+                    metadata = {
+                        **metadata_base,
+                        "position": position,
+                        "graph_chunk_id": graph_chunk_id,
+                        "chunk_strategy": self.chunk_strategy,
+                        "collection": collection_name,
+                        "parent_id": parent_id
+                    }
+                    docs.append({"page_content": safe_chunk, "metadata": metadata})
+                    source_positions[source] += 1
         return docs
 
     def load_documents(self):

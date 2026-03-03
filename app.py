@@ -47,8 +47,12 @@ def _copiar_carpeta_recursiva(origen: str, destino_base: str) -> int:
 
     base_name = os.path.basename(origen_abs.rstrip("\\/"))
     copied = 0
+    ignored_dirs = {
+        ".git", ".svn", ".hg", "__pycache__", ".venv", "venv", "node_modules", ".idea", ".vscode"
+    }
 
-    for root, _, files in os.walk(origen_abs):
+    for root, dirs, files in os.walk(origen_abs, topdown=True):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
         rel = os.path.relpath(root, origen_abs)
         for file_name in files:
             src = os.path.join(root, file_name)
@@ -58,8 +62,13 @@ def _copiar_carpeta_recursiva(origen: str, destino_base: str) -> int:
                 rel_target = os.path.join(base_name, rel, file_name)
             dst = os.path.join(destino_base, rel_target)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            copied += 1
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except PermissionError:
+                print(f"⚠️ Permiso denegado al copiar: {src}")
+            except OSError as e:
+                print(f"⚠️ No se pudo copiar {src}: {e}")
 
     return copied
 
