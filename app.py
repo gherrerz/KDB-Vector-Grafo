@@ -179,6 +179,7 @@ def _limpieza_profunda_chroma() -> tuple[bool, str]:
         return False, f"{mensaje}. Detalle: {e}"
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
+@st.cache_resource
 def init_vector_stores():
     if not os.getenv("OPENAI_API_KEY"):
         st.error("❌ API Key no encontrada. Configura el archivo .env")
@@ -214,6 +215,7 @@ def init_vector_stores():
     return client, collections
 
 
+@st.cache_resource
 def init_neo4j_driver():
     if not (NEO4J_URI and NEO4J_USER and NEO4J_PASSWORD):
         return None
@@ -459,6 +461,33 @@ def generar_respuesta(
 
 # --- INTERFAZ DE USUARIO (SIDEBAR) ---
 with st.sidebar:
+    st.subheader("📦 Gestión de Conocimiento")
+    
+    # Input para URL de GitHub
+    github_url = st.text_input("URL de Repositorio GitHub", placeholder="https://github.com/user/repo")
+    
+    if st.button("🚀 Ingestar Proyecto"):
+        if github_url:
+            with st.status("Procesando repositorio...", expanded=True) as status:
+                try:
+                    st.write("📥 Clonando y limpiando código...")
+                    # Instanciamos el ingestor con las rutas correctas
+                    ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
+                    
+                    # Llamamos al nuevo método run que acepta la URL
+                    ingestor.run(github_url=github_url)
+                    
+                    status.update(label="✅ Ingesta completada!", state="complete", expanded=False)
+                    st.success("El repositorio ha sido indexado en ChromaDB y Neo4j.")
+                    
+                    # Opcional: Reiniciar estado para limpiar caché de búsqueda si fuera necesario
+                    st.rerun() 
+                except Exception as e:
+                    status.update(label="❌ Error en la ingesta", state="error")
+                    st.error(f"Detalles: {e}")
+        else:
+            st.warning("Por favor, introduce una URL válida.")
+    st.divider()
     st.header("📥 Ingesta de Evidencia")
     if neo4j_driver is None:
         st.warning("Neo4j no configurado. El sistema funcionará en modo vectorial.")
@@ -564,7 +593,8 @@ with st.sidebar:
                 
                 st.write("Analizando contenido y generando embeddings + grafo (ChromaDB + Neo4j)...")
                 
-                ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH)
+                # Pasar cliente ChromaDB en caché para evitar múltiples instancias
+                ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
                 ingestor.run()
                 
                 status.update(label="✅ KDB Actualizada", state="complete")

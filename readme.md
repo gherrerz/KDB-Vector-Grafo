@@ -3,295 +3,105 @@
 Auditor KDB Pro es una aplicación de auditoría técnica con Streamlit que implementa un **RAG híbrido**:
 
 - **Validación semántica:** ChromaDB (similitud vectorial)
+````markdown
+# 🕵️‍♂️ Auditor KDB Pro (RAG Híbrido)
+
+Auditor KDB Pro es una aplicación de auditoría técnica con Streamlit que implementa un **RAG híbrido**:
+
+- **Validación semántica:** ChromaDB (similitud vectorial)
 - **Validación estructural:** Neo4j (grafo de continuidad documental)
 
 El sistema responde en español, cita fuentes y mantiene trazabilidad basada en evidencia.
 
 ---
 
+## Estado actual del proyecto (3-mar-2026)
+
+Breve resumen:
+
+- La aplicación Streamlit arranca localmente y la UI está disponible (ej. http://localhost:8503).
+- Se actualizaron dependencias y se añadieron utilidades para compatibilidad con Python 3.14, además de parches temporales aplicados en el `venv` para `chromadb`/`pydantic`.
+- Se implementó la capacidad de clonar repositorios GitHub y limpiarlos antes de indexar (`scripts/github_loader.py`).
+
+Cambios y mejoras relevantes:
+
+- `requirements.txt` actualizado (pydantic >=2, chromadb >=0.5.0, GitPython instalado).
+- `app.py`:
+  - `@st.cache_resource` en inicializadores de ChromaDB y Neo4j para evitar reinicios y conflictos de instancias.
+  - Correcciones en rutas y variables (`DATA_PATH`, `CHROMA_PATH`).
+  - Integración con el ingestor para reusar el cliente Chroma en caché.
+- `ingestion.py`:
+  - `KDBIngestor.__init__` ahora acepta un `chroma_client` opcional.
+  - `run(github_url=...)` soporta descarga y limpieza de repositorios antes de indexar.
+- `scripts/github_loader.py`: nuevo loader para clonar y filtrar repositorios.
+- `pydantic_patch.py`: parche temporal para mitigar errores de inferencia de `pydantic` en Python 3.14 (se aplicó localmente para permitir ejecución).
+
+Notas importantes sobre compatibilidad y seguridad:
+
+- Las modificaciones aplicadas directamente dentro del `venv` y el parche de `pydantic` son soluciones temporales para que el proyecto funcione en tu entorno actual (Python 3.14). Recomendado: usar Python 3.13 o esperar una actualización de `chromadb`/`pydantic` upstream y revertir los parches locales.
+- Una clave OpenAI fue probada y añadida en `.env` para desarrollo; si alguna clave fue expuesta, revócala inmediatamente en https://platform.openai.com/account/api-keys y crea una nueva.
+
+---
+
 ## ✅ Funcionalidades
 
-- Ingesta de documentos `.pdf`, `.xlsx`, `.xls`
-- Ingesta recursiva de texto y código fuente (`.py`, `.js`, `.ts`, `.java`, `.md`, `.txt`, etc.)
-- Fragmentación de texto en chunks con solapamiento
-- Indexación semántica en ChromaDB
-- Indexación estructural en Neo4j con:
-  - `(:Document)-[:HAS_CHUNK]->(:Chunk)`
-  - `(:Chunk)-[:NEXT]->(:Chunk)`
-- Consulta híbrida en tiempo real para reforzar precisión de respuesta
+- Ingesta de documentos `.pdf`, `.xlsx`, `.xls` y ficheros de texto/código.
+- Indexación semántica con ChromaDB (múltiples colecciones: `kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
+- Indexación estructural en Neo4j (Document -> Chunk -> NEXT).
+- Ingesta recursiva de carpetas y clonación de repositorios GitHub para indexado.
+- Consulta híbrida (semántica + estructural) y generación de respuestas con OpenAI.
 
 ---
 
-## 🧱 Arquitectura
-
-### 1) Ingesta (`ingestion.py`)
-
-1. Carga documentos desde `./documentos_fuente`
-   - Incluye subcarpetas (útil para repositorios completos)
-2. Divide texto en chunks
-3. Hace `upsert` en colección ChromaDB `kdb_principal`
-4. Construye/actualiza grafo en Neo4j:
-   - Nodo `Document` por archivo
-   - Nodo `Chunk` por fragmento
-   - Relación `HAS_CHUNK` y `NEXT`
-
-### 2) Consulta (`app.py`)
-
-1. Recupera evidencia semántica desde ChromaDB
-2. Recupera evidencia estructural desde Neo4j por keywords
-3. Combina ambas evidencias y arma prompt final
-4. Genera respuesta con OpenAI (`gpt-4o`)
-
-Si Neo4j no está configurado, la app funciona en modo vectorial sin romperse.
-
-### 3) Diagrama de solución (RAG Híbrido)
-
-```mermaid
-flowchart LR
-   U[Usuario en Streamlit] --> Q[Pregunta]
-   U --> F[Sube PDF/Excel]
-
-   F --> I[ingestion.py]
-   I --> C1[Chunking]
-   C1 --> V[(ChromaDB\nColección kdb_principal)]
-   C1 --> G[(Neo4j\nDocument + Chunk + NEXT)]
-
-   Q --> A[app.py\nrecuperar_evidencia_hibrida]
-   A --> VQ[Consulta semántica\nTop-K]
-   A --> GQ[Consulta estructural\nKeywords + continuidad]
-
-   VQ --> M[Combinación de evidencia]
-   GQ --> M
-   M --> LLM[OpenAI gpt-4o]
-   LLM --> R[Respuesta con citas]
-   R --> U
-
-   G -. opcional .-> A
-```
-
-### 4) Secuencia operacional (paso a paso)
-
-```mermaid
-sequenceDiagram
-   autonumber
-   participant U as Usuario
-   participant S as Streamlit app.py
-   participant I as ingestion.py
-   participant C as ChromaDB
-   participant N as Neo4j
-   participant O as OpenAI gpt-4o
-
-   U->>S: Sube archivo PDF/Excel
-   S->>I: run() de KDBIngestor
-   I->>I: Carga y divide en chunks
-   I->>C: upsert chunks + metadatos
-   I->>N: MERGE Document/Chunk/NEXT
-   I-->>S: Ingesta finalizada
-
-   U->>S: Envía pregunta
-   S->>C: query semántica Top-K
-   S->>N: query estructural keywords + continuidad
-   C-->>S: Evidencia semántica
-   N-->>S: Evidencia estructural
-   S->>S: Fusiona evidencia híbrida
-   S->>O: Prompt con contexto combinado
-   O-->>S: Respuesta auditada
-   S-->>U: Respuesta con citas
-```
-
----
-
-## ✂️ Estrategias de chunking (solo descomentando)
-
-En `ingestion.py`, dentro de `KDBIngestor.__init__`, deja activa **solo una** de estas líneas:
-
-```python
-self.chunk_strategy = "char_overlap"
-# self.chunk_strategy = "sentence_window"
-# self.chunk_strategy = "paragraph_window"
-# self.chunk_strategy = "heading_window"
-# self.chunk_strategy = "code_aware"
-```
-
-Opciones disponibles:
-
-- `char_overlap` (actual por defecto): chunks por tamaño fijo + overlap.
-- `sentence_window`: ventanas por oraciones con solapamiento semántico.
-- `paragraph_window`: ventanas por párrafos (mejor para informes/tablas narradas).
-- `heading_window`: prioriza secciones por encabezados (Markdown o títulos numerados).
-- `code_aware`: intenta separar por bloques de código (funciones/clases) y luego ventana por líneas.
-
-Parámetros que puedes ajustar en el mismo `__init__`:
-
-- `chunk_size`, `chunk_overlap`
-- `sentence_window_size`, `sentence_overlap`
-- `paragraph_window_size`, `paragraph_overlap`
-- `code_line_window`, `code_line_overlap`
-
----
-
-## 🧠 Multi-colección / Multi-vector (implementado)
-
-La ingesta ahora puede guardar embeddings en **múltiples colecciones** con diferentes estrategias de chunking en una sola corrida:
-
-- `kdb_small`: chunks pequeños orientados a precisión semántica.
-- `kdb_large`: chunks grandes orientados a más contexto (perfil principal para grafo).
-- `kdb_code`: chunks orientados a código (`code_aware`).
-
-Configuración en `ingestion.py`:
-
-```python
-self.enable_multi_collection = True
-# self.enable_multi_collection = False
-```
-
-Si `False`, vuelve al modo clásico con una sola colección (`kdb_principal`) usando `self.chunk_strategy`.
-
-Además, cada vector guarda metadatos para filtrar búsquedas:
-
-- `source`
-- `file_type`
-- `chunk_strategy`
-- `collection`
-- `parent_id` (vincula multi-vector del mismo documento base)
-- `position`
-
----
-
-## 🔎 Filtros en consulta (UI)
-
-En el sidebar de `app.py` ahora puedes filtrar recuperación vectorial por:
-
-- **Estrategia de chunk** (`all`, `char_overlap`, `sentence_window`, etc.)
-- **Colección** (`all`, `kdb_small`, `kdb_large`, `kdb_code`, etc.)
-
-La app consulta una o varias colecciones, combina resultados y deduplica por `parent_id`.
-
----
-
-## 💻 Repositorios de código + documentación
-
-Para que el sistema lea, guarde y entienda código fuente junto con documentación:
-
-1. Copia el repo (o carpeta del repo) dentro de `./documentos_fuente/`.
-2. Ejecuta **Indexar Nueva Evidencia** en la app.
-3. Recomendación de estrategia:
-   - Código: `code_aware`
-   - Documentación técnica (`README`, specs): `heading_window` o `paragraph_window`
-
-Tip práctico: si vas a indexar mezcla de código + docs en una sola corrida, empieza con `code_aware` y luego prueba `heading_window` para comparar calidad de respuesta.
-
----
-
-## 📁 Estructura del proyecto
-
-```text
-.
-├── app.py
-├── ingestion.py
-├── requirements.txt
-├── .env.example
-├── docker-compose.neo4j.yml
-├── scripts/
-│   ├── setup_neo4j.ps1
-│   └── check_neo4j.py
-├── documentos_fuente/
-└── db_chroma_kdb/
-```
-
----
-
-## ⚙️ Variables de entorno
-
-Crea `.env` a partir de `.env.example`:
-
-```dotenv
-OPENAI_API_KEY=YOUR_OPENAI_API_KEY
-OPENAI_MODEL=text-embedding-3-small
-
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=YOUR_NEO4J_PASSWORD
-NEO4J_DATABASE=neo4j
-```
-
----
-
-## 🐳 Instalación de Neo4j (recomendada en Windows)
-
-Prerequisito: Docker Desktop instalado y en ejecución.
-
-1. Inicializa Neo4j + configura `.env` automáticamente:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Password "TuPasswordSeguro"
-```
-
-2. Verifica conectividad real desde el proyecto:
-
-```powershell
-.\.venv\Scripts\python.exe .\scripts\check_neo4j.py
-```
-
-3. (Opcional) Abrir Neo4j Browser:
-
-- URL: `http://localhost:7474`
-- User: `neo4j`
-- Password: el valor usado en `-Password`
-
-4. Para detener Neo4j:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Stop
-```
-
----
-
-## 🛠️ Instalación y ejecución
+## ⚙️ Rápido: instalación y ejecución (recomendado)
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+# Opcional: levantar Neo4j con el script si deseas capacidad estructural
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Password "TuPasswordSeguro"
 .\.venv\Scripts\python.exe .\scripts\check_neo4j.py
 python -m streamlit run app.py
 ```
 
----
-
-## 🔎 Verificación rápida E2E
-
-1. Inicia la app con Streamlit
-2. Sube uno o más documentos en el sidebar
-3. Pulsa **Indexar Nueva Evidencia**
-4. Verifica en UI:
-   - “Neo4j conectado” si está configurado
-   - consulta responde con citas de fuente
+La app mostrará la URL local en la consola de Streamlit (ej. `http://localhost:8503`).
 
 ---
 
-## 📦 Dependencias clave
+## ¿Cómo indexar?
 
-- `chromadb==0.4.22`
+1. Abre la UI en el navegador.
+2. En el sidebar sube archivos o indica una carpeta local para indexar.
+3. O usa la sección "Ingestar Proyecto" para pegar la URL de un repo GitHub y pulsar "Ingestar".
+4. Espera a que la barra de estado indique finalizado; luego formula preguntas en el chat.
+
+---
+
+## Dependencias clave (actualizadas)
+
+- `pydantic>=2.0.0`
+- `chromadb>=0.5.0`
 - `openai>=1.0.0`
 - `neo4j>=5.0.0`
-- `pydantic>=1.10.0,<2.0.0`
 - `streamlit>=1.18.1`
 
 ---
 
-## 🧯 Problemas comunes
+## Problemas comunes y recomendaciones
 
-- **Falta `OPENAI_API_KEY`:** la UI detiene ejecución con mensaje de error.
-- **Neo4j no responde:** la app entra en modo solo vectorial.
-- **Dependencias de `unstructured` en Windows:** puede requerir Build Tools.
-- **Documentos no actualizados:** reindexa desde sidebar tras subir archivos.
+- Si ves errores de `pydantic`/`chromadb` con Python 3.14, crea un entorno con Python 3.13 y reinstala las dependencias para una solución más estable.
+- Si aparece el error "An instance of Chroma already exists for ./db_chroma_kdb with different settings", reinicia la app o elimina la carpeta `db_chroma_kdb` (asegúrate de respaldar datos si son importantes).  Ahora `app.py` reusa el cliente Chroma en caché para evitar ese conflicto.
 
 ---
 
-## 📌 Nota de seguridad
+## Seguridad
 
-No publiques claves reales en `.env.example` ni en commits.
-Si una clave se expone, rótala inmediatamente.
+- Nunca comprometas claves en commits. Revoca y regenera claves si se exponen.
+- Mantén `.env` fuera del repositorio y usa un gestor de secretos en producción.
+
+---
+
+Si quieres, actualizo este README con un `README_RUN.md` con comandos y recomendaciones para migrar a Python 3.13 y cómo limpiar los parches locales en el `venv`.
+```

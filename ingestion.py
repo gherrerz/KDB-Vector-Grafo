@@ -5,6 +5,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from scripts.github_loader import GitHubLoader
 
 # simple loaders to avoid langchain_community
 from pypdf import PdfReader
@@ -14,16 +15,20 @@ import openpyxl
 load_dotenv()
 
 class KDBIngestor:
-    def __init__(self, data_path, db_path):
+    def __init__(self, data_path, db_path, chroma_client=None):
         """
         Inicializa el ingestor de la base de conocimientos.
         data_path: Carpeta donde están los documentos fuente.
         db_path: Carpeta donde se guardará la base vectorial.
+        chroma_client: Cliente ChromaDB existente (opcional). Si no se proporciona, se crea uno nuevo.
         """
         self.data_path = data_path
         self.db_path = db_path
-        # inicializar cliente ChromaDB con persistencia
-        self.client = chromadb.PersistentClient(path=self.db_path)
+        # Usar cliente existente si se proporciona, sino crear uno nuevo
+        if chroma_client is not None:
+            self.client = chroma_client
+        else:
+            self.client = chromadb.PersistentClient(path=self.db_path)
         self.embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
             api_key=os.getenv("OPENAI_API_KEY"),
             model_name="text-embedding-3-small"
@@ -519,10 +524,12 @@ class KDBIngestor:
                     print(f"❌ Error cargando {rel_path}: {e}")
         return documents
 
-    def run(self):
+    def run(self, github_url=None):
         """Proceso principal de ingesta, particionado e indexación."""
-        print("🚀 Iniciando proceso de ingesta...")
-        
+        # 0. Si hay GitHub, descargar primero
+        if github_url:
+            loader = GitHubLoader(self.data_path)
+            loader.fetch_repo(github_url)
         # 1. Cargar documentos
         raw_docs = self.load_documents()
         if not raw_docs:
