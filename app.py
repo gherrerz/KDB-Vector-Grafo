@@ -316,23 +316,6 @@ Estructure su respuesta con estas secciones cuando sea relevante:
 """
 
 
-def consultar_evidencia_kdb(
-    query: str,
-    strategy_filter: str = "all",
-    collection_filter: str = "all",
-    per_collection_k: int = 4,
-    max_final_results: int = 8,
-) -> list[dict[str, Any]]:
-    """Wrapper compatible para recuperar resultados de Stage 2."""
-    return _retrieve_vector_stage2(
-        query=query,
-        strategy_filter=strategy_filter,
-        collection_filter=collection_filter,
-        per_collection_k=per_collection_k,
-        max_final_results=max_final_results,
-    )["results"]
-
-
 def _classify_query_intent(query: str) -> str:
     """Clasifica intención de consulta para ajustar retrieval."""
     query_lower = query.lower()
