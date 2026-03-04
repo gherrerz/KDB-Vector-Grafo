@@ -321,6 +321,8 @@ def _classify_query_intent(query: str) -> str:
     query_lower = query.lower()
     if any(token in query_lower for token in ["impacto", "afecta", "depende", "blast radius"]):
         return "impact_analysis"
+    if any(token in query_lower for token in ["dependencia", "dependencias", "dependency", "depends_on", "acoplamiento"]):
+        return "dependency"
     if any(token in query_lower for token in ["error", "bug", "falla", "fallo", "exception", "traceback"]):
         return "bug_rootcause"
     if any(token in query_lower for token in ["seguridad", "vulnerabilidad", "inyeccion", "xss", "auth"]):
@@ -366,7 +368,7 @@ def _resolve_stage1_k(intent: str, per_collection_k: int) -> int:
     base = max(2, per_collection_k)
     if intent in {"listing", "counting"}:
         return max(20, base * 4)
-    if intent in {"impact_analysis", "architecture"}:
+    if intent in {"impact_analysis", "architecture", "dependency"}:
         return max(12, base * 3)
     if intent in {"security", "performance", "refactor_plan"}:
         return max(14, base * 3)
@@ -379,6 +381,7 @@ def _retrieve_stage1_candidates(
     collection_filter: str,
     per_collection_k: int,
     intent: str,
+    extra_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     """Stage 1: recuperación de alta cobertura por colección."""
     if not vector_stores:
@@ -398,6 +401,10 @@ def _retrieve_stage1_candidates(
 
     stage1_k = _resolve_stage1_k(intent, per_collection_k)
     expanded_queries = _build_query_expansions(query, intent)
+    if extra_terms:
+        terms = [term.strip() for term in extra_terms if term and term.strip()]
+        if terms:
+            expanded_queries.append(" ".join(terms[:6]))
     all_docs: list[dict[str, Any]] = []
 
     for collection_name, collection in target_collections.items():
@@ -420,6 +427,15 @@ def _retrieve_stage1_candidates(
                     distance = distances[i] if i < len(distances) else None
                     all_docs.append({
                         "text": text,
+                        "doc_id": metadata.get("doc_id", ""),
+                        "repository": metadata.get("repository", ""),
+                        "file_path": metadata.get("file_path", metadata.get("source", "")),
+                        "language": metadata.get("language", ""),
+                        "symbol_name": metadata.get("symbol_name", ""),
+                        "symbol_type": metadata.get("symbol_type", ""),
+                        "chunk_type": metadata.get("chunk_type", ""),
+                        "line_start": metadata.get("line_start", 0),
+                        "line_end": metadata.get("line_end", 0),
                         "source": metadata.get("source", ""),
                         "collection": metadata.get("collection", collection_name),
                         "chunk_strategy": metadata.get("chunk_strategy", ""),
@@ -502,7 +518,7 @@ def _resolve_mmr_lambda(intent: str) -> float:
     """Define balance relevancia/diversidad para MMR según intención."""
     if intent in {"listing", "counting"}:
         return 0.35
-    if intent in {"impact_analysis", "architecture", "refactor_plan"}:
+    if intent in {"impact_analysis", "architecture", "dependency", "refactor_plan"}:
         return 0.50
     if intent in {"security", "performance"}:
         return 0.58
@@ -606,15 +622,18 @@ def _retrieve_vector_stage2(
     collection_filter: str,
     per_collection_k: int,
     max_final_results: int,
+    intent_override: str | None = None,
+    extra_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     """Pipeline vectorial completo en 2 etapas."""
-    intent = _classify_query_intent(query)
+    intent = intent_override or _classify_query_intent(query)
     stage1 = _retrieve_stage1_candidates(
         query=query,
         strategy_filter=strategy_filter,
         collection_filter=collection_filter,
         per_collection_k=per_collection_k,
         intent=intent,
+        extra_terms=extra_terms,
     )
     stage2 = _rerank_stage2(
         candidates=stage1.get("results", []),
@@ -696,6 +715,127 @@ def consultar_evidencia_grafo(
         return []
 
 
+def consultar_dependencias_grafo(
+    query: str,
+    hop_limit: int = 3,
+    max_nodes: int = 40,
+) -> dict[str, Any]:
+    """Recupera relaciones de dependencia de código hasta N hops."""
+    if neo4j_driver is None:
+        return {
+            "relations": [],
+            "seeds": [],
+            "terms": [],
+            "limitations": ["Neo4j no disponible: usando solo vector retrieval."],
+        }
+
+    keywords = _extraer_keywords(query)
+    if not keywords:
+        return {
+            "relations": [],
+            "seeds": [],
+            "terms": [],
+            "limitations": ["Sin keywords claras para recuperar dependencias en grafo."],
+        }
+
+    seed_cypher = """
+    MATCH (e:CodeEntity)
+    WHERE any(k IN $keywords WHERE toLower(e.name) CONTAINS k)
+       OR any(k IN $keywords WHERE toLower(coalesce(e.source,'')) CONTAINS k)
+    RETURN e.id AS id, e.name AS name, e.source AS source, e.kind AS kind
+    LIMIT $max_nodes
+    """
+
+    rel_cypher = """
+    MATCH (seed:CodeEntity)
+    WHERE seed.id IN $seed_ids
+    MATCH p=(seed)-[:DEPENDS_ON*1..3]-(n:CodeEntity)
+    WITH seed, n, length(p) AS hops
+    RETURN DISTINCT
+      seed.name AS from_name,
+      seed.source AS from_source,
+      n.name AS to_name,
+      n.source AS to_source,
+      hops
+    ORDER BY hops ASC
+    LIMIT $max_nodes
+    """
+
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            seed_rows = list(
+                session.run(
+                    seed_cypher,
+                    keywords=keywords,
+                    max_nodes=max_nodes,
+                )
+            )
+            seeds = [
+                {
+                    "id": row.get("id", ""),
+                    "name": row.get("name", ""),
+                    "source": row.get("source", ""),
+                    "kind": row.get("kind", ""),
+                }
+                for row in seed_rows
+            ]
+            seed_ids = [row["id"] for row in seeds if row.get("id")]
+
+            relations: list[dict[str, Any]] = []
+            if seed_ids:
+                relation_rows = session.run(
+                    rel_cypher,
+                    seed_ids=seed_ids,
+                    max_nodes=max_nodes,
+                )
+                for row in relation_rows:
+                    relations.append(
+                        {
+                            "from_name": row.get("from_name", ""),
+                            "from_source": row.get("from_source", ""),
+                            "to_name": row.get("to_name", ""),
+                            "to_source": row.get("to_source", ""),
+                            "hops": int(row.get("hops", 1) or 1),
+                            "type": "DEPENDS_ON",
+                        }
+                    )
+
+            terms = []
+            for seed in seeds[:20]:
+                if seed.get("name"):
+                    terms.append(seed["name"])
+
+            unique_terms = []
+            seen_terms = set()
+            for term in terms:
+                normalized = term.strip().lower()
+                if not normalized or normalized in seen_terms:
+                    continue
+                seen_terms.add(normalized)
+                unique_terms.append(term)
+
+            limitations = []
+            if not seeds:
+                limitations.append("Sin seeds de entidades en CodeEntity para esta consulta.")
+            if seeds and not relations:
+                limitations.append("Se detectaron entidades seed, pero sin relaciones DEPENDS_ON vinculadas.")
+
+            return {
+                "relations": relations,
+                "seeds": seeds,
+                "terms": unique_terms[:8],
+                "limitations": limitations,
+                "hop_limit": hop_limit,
+            }
+    except (Neo4jError, ServiceUnavailable):
+        return {
+            "relations": [],
+            "seeds": [],
+            "terms": [],
+            "limitations": ["Error consultando Neo4j: fallback a retrieval vectorial."],
+        }
+
+
 def recuperar_evidencia_hibrida(
     query: str,
     strategy_filter: str = "all",
@@ -704,12 +844,17 @@ def recuperar_evidencia_hibrida(
     max_final_results: int = 8,
 ) -> dict[str, list[dict[str, Any]]]:
     """Combina evidencia semántica de Chroma con evidencia de Neo4j."""
+    intent = _classify_query_intent(query)
+    dependencia_grafo = consultar_dependencias_grafo(query, hop_limit=3)
+
     vector_pipeline = _retrieve_vector_stage2(
         query=query,
         strategy_filter=strategy_filter,
         collection_filter=collection_filter,
         per_collection_k=per_collection_k,
         max_final_results=max_final_results,
+        intent_override=intent,
+        extra_terms=dependencia_grafo.get("terms", []),
     )
     evidencia_vector = vector_pipeline.get("results", [])
     evidencia_grafo = consultar_evidencia_grafo(query)
@@ -732,8 +877,16 @@ def recuperar_evidencia_hibrida(
     return {
         "vector": evidencia_vector,
         "graph": evidencia_grafo,
+        "graph_dependencies": dependencia_grafo.get("relations", []),
+        "graph_seeds": dependencia_grafo.get("seeds", []),
+        "graph_limitations": dependencia_grafo.get("limitations", []),
         "combined": combined,
-        "retrieval_stats": vector_pipeline.get("stats", {}),
+        "retrieval_stats": {
+            **vector_pipeline.get("stats", {}),
+            "graph_relations": len(dependencia_grafo.get("relations", [])),
+            "graph_seeds": len(dependencia_grafo.get("seeds", [])),
+            "graph_terms_used": dependencia_grafo.get("terms", []),
+        },
     }
 
 
@@ -759,7 +912,13 @@ def generar_respuesta(
     evidencia_semantica = "\n\n".join(
         [
             (
-                f"Fuente: {d['source']} | "
+                f"Fuente: {d.get('file_path', d.get('source', ''))}:"
+                f"{d.get('line_start', 0)}-{d.get('line_end', 0)} | "
+                f"Repo: {d.get('repository', '')} | "
+                f"Lenguaje: {d.get('language', '')} | "
+                f"Símbolo: {d.get('symbol_name', '')} "
+                f"({d.get('symbol_type', '')}) | "
+                f"Chunk: {d.get('chunk_type', '')} | "
                 f"Colección: {d.get('collection', '')} | "
                 f"Estrategia: {d.get('chunk_strategy', '')}\n{d['text']}"
             )
@@ -779,12 +938,31 @@ def generar_respuesta(
         for d in evidencia["graph"]
     ])
 
+    evidencia_dependencias = "\n".join(
+        [
+            (
+                f"{d.get('from_name', '')} [{d.get('from_source', '')}] "
+                f"--DEPENDS_ON/{d.get('hops', 1)}--> "
+                f"{d.get('to_name', '')} [{d.get('to_source', '')}]"
+            )
+            for d in evidencia.get("graph_dependencies", [])
+        ]
+    )
+
     if not evidencia_semantica:
         evidencia_semantica = "No se recuperó evidencia semántica en ChromaDB."
     if not evidencia_estructural:
         evidencia_estructural = (
             "No se recuperó evidencia estructural en Neo4j."
         )
+    if not evidencia_dependencias:
+        evidencia_dependencias = (
+            "No se recuperaron relaciones DEPENDS_ON para esta consulta."
+        )
+
+    limitaciones = "\n".join(
+        evidencia.get("graph_limitations", [])
+    ).strip() or "Sin limitaciones adicionales detectadas en retrieval."
 
     prompt = (
         f"{system_prompt}\n\n"
@@ -795,6 +973,8 @@ def generar_respuesta(
         "2) Estructural (posición y continuidad del chunk en grafo)\n\n"
         f"EVIDENCIA SEMÁNTICA:\n{evidencia_semantica}\n\n"
         f"EVIDENCIA ESTRUCTURAL:\n{evidencia_estructural}\n\n"
+        f"EVIDENCIA DE DEPENDENCIAS (GRAFO CÓDIGO):\n{evidencia_dependencias}\n\n"
+        f"LIMITACIONES DE RETRIEVAL:\n{limitaciones}\n\n"
         f"PREGUNTA:\n{user_question}"
     )
     # use new OpenAI chat API (v1.0+)
@@ -1290,7 +1470,10 @@ if user_input := st.chat_input("Consulta la base de conocimientos..."):
                         f"{retrieval_stats.get('stage1_raw', 0)}/"
                         f"{retrieval_stats.get('stage1_deduped', 0)} | "
                         "S2 final: "
-                        f"{retrieval_stats.get('stage2_final', 0)}"
+                        f"{retrieval_stats.get('stage2_final', 0)} | "
+                        "Graph rels/seeds: "
+                        f"{retrieval_stats.get('graph_relations', 0)}/"
+                        f"{retrieval_stats.get('graph_seeds', 0)}"
                     )
                     st.write(
                         f"top-k por colección: {retrieval_k} | "

@@ -197,6 +197,18 @@ class TestKDBIngestorHelpers(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(positions[0], 0)
 
+    def test_infer_repository_from_source(self) -> None:
+        """Repository inference should use first folder segment."""
+        value = self.ingestor._infer_repository_from_source(
+            "mall/mall-admin/src/main/App.java"
+        )
+        self.assertEqual(value, "mall")
+
+    def test_infer_language_from_source(self) -> None:
+        """Language inference should map known extensions."""
+        value = self.ingestor._infer_language_from_source("src/service.py", "code")
+        self.assertEqual(value, "python")
+
 
 if __name__ == "__main__":
     unittest.main()

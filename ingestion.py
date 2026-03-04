@@ -756,9 +756,8 @@ class KDBIngestor:
                 line_start += line_step
         return chunks
 
-    def _split_text(self, text: str) -> list[str]:
-        """Despacha el texto al algoritmo de chunking configurado."""
-        strategy = self.chunk_strategy
+    def _split_text_with_strategy(self, text: str, strategy: str) -> list[str]:
+        """Aplica una estrategia de chunking explícita al texto."""
         if strategy == "sentence_window":
             return self._split_sentence_window(text)
         if strategy == "paragraph_window":
@@ -769,6 +768,59 @@ class KDBIngestor:
             return self._split_code_aware(text)
         return self._split_char_overlap(text)
 
+    def _split_text(self, text: str) -> list[str]:
+        """Despacha el texto al algoritmo de chunking configurado."""
+        return self._split_text_with_strategy(text, self.chunk_strategy)
+
+    def _should_include_document_in_collection(
+        self,
+        metadata: dict[str, Any],
+        collection_name: str,
+    ) -> bool:
+        """Define si un documento debe indexarse en la colección destino."""
+        file_type = (metadata.get("file_type", "") or "").lower()
+        if collection_name == "kdb_code":
+            return file_type == "code"
+        return True
+
+    def _resolve_dynamic_chunk_strategy(
+        self,
+        metadata: dict[str, Any],
+        collection_name: str,
+    ) -> str:
+        """Selecciona estrategia de chunking dinámica por tipo de documento."""
+        base_strategy = self.chunk_strategy
+        file_type = (metadata.get("file_type", "") or "").lower()
+        source = (metadata.get("source", "") or "").lower()
+        ext = os.path.splitext(source)[1]
+
+        if collection_name == "kdb_code" or file_type == "code":
+            return "code_aware"
+
+        if file_type == "pdf":
+            return "sentence_window"
+
+        if file_type == "excel":
+            return "paragraph_window"
+
+        if ext in {".md", ".markdown", ".rst"}:
+            return "heading_window"
+
+        if ext in {
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".properties",
+        }:
+            return "paragraph_window"
+
+        return base_strategy
+
     def _chunk_documents(
         self,
         raw_docs: list[dict[str, Any]],
@@ -777,6 +829,7 @@ class KDBIngestor:
         """Convierte documentos crudos en chunks listos para indexación."""
         docs: list[dict[str, Any]] = []
         source_positions: dict[str, int] = {}
+        source_cursors: dict[str, int] = {}
         for raw_idx, d in enumerate(raw_docs):
             text = d.get("page_content", "") or ""
             text = text.strip()
@@ -784,22 +837,56 @@ class KDBIngestor:
                 continue
 
             metadata_base = d.get("metadata", {})
+            if not self._should_include_document_in_collection(
+                metadata_base,
+                collection_name,
+            ):
+                continue
+
             source = metadata_base.get("source", "desconocido")
             source_positions.setdefault(source, 0)
+            source_cursors.setdefault(source, 0)
             source_id = self._normalize_id(source)
+            effective_strategy = self._resolve_dynamic_chunk_strategy(
+                metadata_base,
+                collection_name,
+            )
+            file_type = metadata_base.get("file_type", "text")
+            repository = self._infer_repository_from_source(source)
+            language = self._infer_language_from_source(source, file_type)
 
-            chunks = self._split_text(text)
+            chunks = self._split_text_with_strategy(text, effective_strategy)
             for chunk in chunks:
                 safe_chunks = self._enforce_embedding_token_limit(chunk)
                 for safe_chunk in safe_chunks:
                     position = source_positions[source]
                     graph_chunk_id = f"{source_id}::{position}"
                     parent_id = f"{source_id}::raw::{raw_idx}"
+                    line_start, line_end, next_cursor = self._locate_chunk_line_span(
+                        text,
+                        safe_chunk,
+                        search_start=source_cursors[source],
+                    )
+                    source_cursors[source] = next_cursor
+                    symbol_meta = self._resolve_symbol_metadata(
+                        safe_chunk,
+                        source,
+                        file_type,
+                    )
                     metadata = {
                         **metadata_base,
+                        "doc_id": graph_chunk_id,
+                        "repository": repository,
+                        "file_path": source,
+                        "language": language,
+                        "symbol_name": symbol_meta.get("symbol_name", ""),
+                        "symbol_type": symbol_meta.get("symbol_type", ""),
+                        "chunk_type": symbol_meta.get("chunk_type", "paragraph"),
+                        "line_start": line_start,
+                        "line_end": line_end,
                         "position": position,
                         "graph_chunk_id": graph_chunk_id,
-                        "chunk_strategy": self.chunk_strategy,
+                        "chunk_strategy": effective_strategy,
                         "collection": collection_name,
                         "parent_id": parent_id
                     }
@@ -824,6 +911,140 @@ class KDBIngestor:
         if ext in self.code_extensions:
             return "code"
         return "text"
+
+    def _infer_repository_from_source(self, source: str) -> str:
+        """Infiere repositorio lógico desde la ruta relativa del archivo."""
+        if not source:
+            return "desconocido"
+        parts = [p for p in source.replace("\\", "/").split("/") if p]
+        return parts[0] if parts else "desconocido"
+
+    def _infer_language_from_source(self, source: str, file_type: str) -> str:
+        """Infiere lenguaje principal a partir de extensión y tipo."""
+        ext = os.path.splitext((source or "").lower())[1]
+        ext_to_lang = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".jsx": "javascript",
+            ".java": "java",
+            ".cs": "csharp",
+            ".go": "go",
+            ".rs": "rust",
+            ".cpp": "cpp",
+            ".c": "c",
+            ".h": "c",
+            ".hpp": "cpp",
+            ".php": "php",
+            ".rb": "ruby",
+            ".kt": "kotlin",
+            ".swift": "swift",
+            ".scala": "scala",
+            ".sql": "sql",
+            ".sh": "bash",
+            ".ps1": "powershell",
+            ".json": "json",
+            ".yml": "yaml",
+            ".yaml": "yaml",
+            ".xml": "xml",
+            ".toml": "toml",
+            ".md": "markdown",
+            ".rst": "rst",
+            ".txt": "text",
+            ".pdf": "pdf",
+            ".xlsx": "excel",
+            ".xls": "excel",
+        }
+        if ext in ext_to_lang:
+            return ext_to_lang[ext]
+        if file_type == "code":
+            return "code"
+        if file_type == "excel":
+            return "excel"
+        if file_type == "pdf":
+            return "pdf"
+        return "text"
+
+    def _resolve_symbol_metadata(
+        self,
+        chunk_text: str,
+        source: str,
+        file_type: str,
+    ) -> dict[str, str]:
+        """Resuelve nombre/tipo de símbolo y tipo de chunk por heurística."""
+        if not chunk_text:
+            return {
+                "symbol_name": Path(source).stem or "desconocido",
+                "symbol_type": "module",
+                "chunk_type": "function_body" if file_type == "code" else "paragraph",
+            }
+
+        if file_type == "code":
+            class_match = re.search(
+                r"(?m)^\s*(?:class|interface|enum|struct)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                chunk_text,
+            )
+            if class_match:
+                return {
+                    "symbol_name": class_match.group(1),
+                    "symbol_type": "class",
+                    "chunk_type": "class_body",
+                }
+
+            function_match = re.search(
+                r"(?m)^\s*(?:async\s+def|def|function|fn)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                chunk_text,
+            )
+            if function_match:
+                return {
+                    "symbol_name": function_match.group(1),
+                    "symbol_type": "function",
+                    "chunk_type": "function_body",
+                }
+
+            return {
+                "symbol_name": Path(source).stem or "desconocido",
+                "symbol_type": "module",
+                "chunk_type": "dependency_summary",
+            }
+
+        heading_match = re.search(r"(?m)^\s*#{1,6}\s+(.+)$", chunk_text)
+        if heading_match:
+            return {
+                "symbol_name": heading_match.group(1).strip()[:120],
+                "symbol_type": "section",
+                "chunk_type": "docstring",
+            }
+
+        return {
+            "symbol_name": Path(source).stem or "desconocido",
+            "symbol_type": "document",
+            "chunk_type": "paragraph",
+        }
+
+    def _locate_chunk_line_span(
+        self,
+        full_text: str,
+        chunk_text: str,
+        search_start: int = 0,
+    ) -> tuple[int, int, int]:
+        """Ubica líneas aproximadas de un chunk dentro del texto original."""
+        if not full_text or not chunk_text:
+            return 1, 1, search_start
+
+        idx = full_text.find(chunk_text, search_start)
+        if idx < 0:
+            idx = full_text.find(chunk_text)
+        if idx < 0:
+            line_start = max(1, full_text.count("\n", 0, search_start) + 1)
+            line_end = line_start + max(0, chunk_text.count("\n"))
+            return line_start, line_end, search_start
+
+        line_start = full_text.count("\n", 0, idx) + 1
+        line_end = line_start + max(0, chunk_text.count("\n"))
+        next_cursor = idx + len(chunk_text)
+        return line_start, line_end, next_cursor
 
     def _extract_code_entities(
         self,
@@ -1266,6 +1487,15 @@ class KDBIngestor:
             texts = [d.get("page_content", "") for d in docs]
             metadatas = [
                 {
+                    "doc_id": d.get("metadata", {}).get("doc_id", ""),
+                    "repository": d.get("metadata", {}).get("repository", ""),
+                    "file_path": d.get("metadata", {}).get("file_path", ""),
+                    "language": d.get("metadata", {}).get("language", ""),
+                    "symbol_name": d.get("metadata", {}).get("symbol_name", ""),
+                    "symbol_type": d.get("metadata", {}).get("symbol_type", ""),
+                    "chunk_type": d.get("metadata", {}).get("chunk_type", ""),
+                    "line_start": d.get("metadata", {}).get("line_start", 0),
+                    "line_end": d.get("metadata", {}).get("line_end", 0),
                     "source": d.get("metadata", {}).get("source", ""),
                     "file_type": d.get("metadata", {}).get("file_type", ""),
                     "chunk_strategy": d.get("metadata", {}).get(
