@@ -128,6 +128,38 @@ flowchart LR
 8. Se combina evidencia, se construye prompt y se invoca OpenAI.
 9. UI muestra respuesta y diagnóstico de recuperación.
 
+Diagrama operacional:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as Usuario
+  participant UI as Streamlit (app.py)
+  participant ING as KDBIngestor (ingestion.py)
+  participant CH as ChromaDB
+  participant N4 as Neo4j
+  participant AI as OpenAI
+
+  U->>UI: Sube archivos/ZIP/carpeta o URL GitHub
+  UI->>ING: run()
+  ING-->>UI: scan_complete
+  loop Por cada archivo soportado
+    ING-->>UI: file_processing / profile_chunked
+    ING->>CH: upsert embeddings por lote
+    ING-->>UI: upsert_batch_result / upsert_split_batch
+  end
+  ING->>N4: indexación estructural (si disponible)
+  ING-->>UI: run_complete
+
+  U->>UI: Realiza consulta
+  UI->>CH: Stage 1 (recall alto)
+  UI->>CH: Stage 2 (reranking MMR)
+  UI->>N4: Evidencia estructural por keywords
+  UI->>AI: Prompt con evidencia combinada
+  AI-->>UI: Respuesta en español
+  UI-->>U: Respuesta + diagnóstico de retrieval
+```
+
 ---
 
 ## ✂️ Estrategias de chunking
