@@ -1,140 +1,228 @@
 # 🕵️‍♂️ Auditor KDB Pro (RAG Híbrido)
 
-Auditor KDB Pro es una aplicación de auditoría técnica con Streamlit que implementa un **RAG híbrido**:
+Auditor KDB Pro es una aplicación de auditoría técnica en Streamlit que combina recuperación semántica y validación estructural para responder preguntas sobre repositorios y documentación técnica.
 
-- **Validación semántica:** ChromaDB (similitud vectorial)
-````markdown
-# 🕵️‍♂️ Auditor KDB Pro (RAG Híbrido)
-
-Auditor KDB Pro es una aplicación de auditoría técnica con Streamlit que implementa un **RAG híbrido**:
-
-- **Validación semántica:** ChromaDB (similitud vectorial)
-- **Validación estructural:** Neo4j (grafo de continuidad documental)
-
-El sistema responde en español, cita fuentes y mantiene trazabilidad basada en evidencia.
+- Validación semántica: ChromaDB (embeddings OpenAI)
+- Validación estructural: Neo4j (continuidad documental + grafo de código)
+- Respuesta final: OpenAI Chat Completions (`gpt-4o`) en español
 
 ---
 
-## Estado actual del proyecto (4-mar-2026)
+## ✅ Capacidades actuales
 
-Breve resumen:
-
-- La aplicación Streamlit opera de forma estable en entorno local.
-- La búsqueda híbrida usa un pipeline vectorial en 2 etapas (recall + reranking) y validación estructural con Neo4j.
-- La ingesta reporta progreso en vivo (escaneo, chunking, batches, errores BadRequest y cierre).
-
-Cambios y mejoras relevantes:
-
-- `app.py`:
-  - Retrieval en 2 etapas: Stage 1 de alta cobertura por intención y Stage 2 con reranking MMR (relevancia + diversidad).
-  - Clasificación de intención (`listing`, `counting`, `impact_analysis`, `bug_rootcause`, `architecture`, `security`, `performance`, `refactor_plan`).
-  - Diagnóstico de consulta en UI: `intent`, `stage1_k`, `stage1_raw`, `stage1_deduped`, `stage2_scored`, `stage2_final`, `stage2_mmr_lambda`.
-  - Respuestas forzadas en español en el prompt de sistema.
-- `ingestion.py`:
-  - Ingesta robusta con guardas por tokens/caracteres y split recursivo en lotes para evitar overflow de embeddings.
-  - Emisión de eventos de progreso para trazabilidad operativa de la indexación.
-  - Indexación combinada en Chroma + Neo4j (continuidad documental y entidades/calls de código para análisis de dependencia).
-- `scripts/github_loader.py`:
-  - Carga de repositorios GitHub con limpieza de artefactos no relevantes previo a indexación.
-
-Notas importantes sobre compatibilidad y seguridad:
-
-- Las modificaciones aplicadas directamente dentro del `venv` y el parche de `pydantic` son soluciones temporales para que el proyecto funcione en tu entorno actual (Python 3.14). Recomendado: usar Python 3.13 o esperar una actualización de `chromadb`/`pydantic` upstream y revertir los parches locales.
-- Una clave OpenAI fue probada y añadida en `.env` para desarrollo; si alguna clave fue expuesta, revócala inmediatamente en https://platform.openai.com/account/api-keys y crea una nueva.
+- Ingesta de PDF, Excel, texto, configuración y código fuente.
+- Indexación multi-colección en ChromaDB (`kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
+- Indexación en Neo4j de:
+  - Flujo documental `Document -> Chunk -> NEXT`
+  - Dependencias de código (`CodeFile`, `CodeEntity`, `DEPENDS_ON`)
+- Consulta híbrida con pipeline en 2 etapas (recall + reranking MMR).
+- Diagnóstico visible en UI: intención, Stage 1/2, cobertura y diversidad.
+- Telemetría de ingesta en vivo (scan, chunking, batches, errores, cierre).
 
 ---
 
-## ✅ Funcionalidades
-
-- Ingesta de documentos `.pdf`, `.xlsx`, `.xls` y archivos de texto/código/config.
-- Indexación semántica multi-colección en ChromaDB (`kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
-- Indexación estructural en Neo4j (`Document -> Chunk -> NEXT`) y grafo de entidades de código (`CodeFile`, `CodeEntity`, `DEPENDS_ON`).
-- Ingesta recursiva desde carpeta local o repositorio GitHub.
-- Consulta híbrida: Stage 1 (recall alto) + Stage 2 (MMR), combinada con evidencia estructural.
-- Telemetría de ingesta en UI (progreso, archivo actual, chunks insertados/fallidos, batches divididos).
-
----
-
-## ⚙️ Rápido: instalación y ejecución (recomendado)
+## ⚙️ Instalación y ejecución rápida
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-# Opcional: levantar Neo4j con el script si deseas capacidad estructural
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Password "TuPasswordSeguro"
-.\.venv\Scripts\python.exe .\scripts\check_neo4j.py
 python -m streamlit run app.py
 ```
 
-La app mostrará la URL local en la consola de Streamlit (normalmente `http://localhost:8501`, salvo que el puerto esté ocupado).
+Opcional (Neo4j local):
 
----
-
-## ¿Cómo indexar?
-
-1. Abre la UI en el navegador.
-2. En el sidebar sube archivos o indica una carpeta local para indexar.
-3. O usa la sección "Ingestar Proyecto" para pegar la URL de un repo GitHub y pulsar "Ingestar".
-4. Espera a que la barra de estado indique finalizado; luego formula preguntas en el chat.
-
----
-
-## Dependencias clave (actualizadas)
-
-- `pydantic>=2.0.0`
-- `chromadb>=0.5.0`
-- `openai>=1.0.0`
-- `neo4j>=5.0.0`
-- `streamlit>=1.18.1`
-- `unstructured[all-docs]>=0.6.1`
-- `pypdf>=3.0.0`
-- `openpyxl>=3.0.10`
-
----
-
-## Problemas comunes y recomendaciones
-
-- Si ves errores de `pydantic`/`chromadb` con Python 3.14, crea un entorno con Python 3.13 y reinstala las dependencias para una solución más estable.
-- Si aparece el error "An instance of Chroma already exists for ./db_chroma_kdb with different settings", reinicia la app o elimina la carpeta `db_chroma_kdb` (asegúrate de respaldar datos si son importantes).  Ahora `app.py` reusa el cliente Chroma en caché para evitar ese conflicto.
-
----
-
-## Seguridad
-
-- Nunca comprometas claves en commits. Revoca y regenera claves si se exponen.
-- Mantén `.env` fuera del repositorio y usa un gestor de secretos en producción.
-
----
-
-## 🧪 Calidad técnica (Checklist antes/después)
-
-Fecha de corte: **4-mar-2026**
-
-### Antes
-
-- [ ] Docstrings faltantes en funciones/clases clave de `app.py` e `ingestion.py`.
-- [ ] Uso extendido de `except Exception` y bloques silenciosos (`pass`).
-- [ ] Varias líneas por encima de 79 caracteres (PEP 8).
-- [ ] Ausencia de tests unitarios para helpers críticos de ingesta/chunking.
-- [ ] Trazabilidad inconsistente por uso de `print` en utilidades/scripts.
-
-### Después
-
-- [x] Docstrings: **0 faltantes** en archivos Python principales auditados.
-- [x] Excepciones genéricas: eliminadas de los módulos principales (`except Exception` -> 0 en el barrido).
-- [x] PEP 8 (79 columnas): `app.py` = 0 y `ingestion.py` = 0 líneas fuera de límite.
-- [x] Tests unitarios: suite activa con **9 tests OK** (`python -m unittest discover -s tests -p "test_*.py"`).
-- [x] Mejor trazabilidad: reemplazo de `print` por `logging` en scripts y flujo de ingesta.
-
-### Evidencia de validación
-
-- [x] `get_errors`: sin errores en `app.py`, `ingestion.py`, `pydantic_patch.py`, `scripts/check_neo4j.py`, `scripts/github_loader.py`.
-- [x] Recuento automático de docstrings y líneas >79 ejecutado en terminal.
-- [x] Ejecución de pruebas automatizadas completada en verde.
-
----
-
-Si quieres, actualizo este README con un `README_RUN.md` con comandos y recomendaciones para migrar a Python 3.13 y cómo limpiar los parches locales en el `venv`.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Password "TuPasswordSeguro"
+.\.venv\Scripts\python.exe .\scripts\check_neo4j.py
 ```
+
+---
+
+## 🧱 Arquitectura
+
+### 1) Ingesta (`ingestion.py`)
+
+Componente principal: clase `KDBIngestor`.
+
+Responsabilidades:
+
+- Descubrir y leer archivos desde `./documentos_fuente` (incluye carga de repo GitHub vía `GitHubLoader`).
+- Clasificar tipo de archivo y aplicar estrategia de chunking por perfil.
+- Controlar límites de embeddings con guardas de tokens/caracteres y split recursivo.
+- Escribir embeddings en ChromaDB por colección.
+- Escribir estructura en Neo4j:
+  - `(:Document)-[:HAS_CHUNK]->(:Chunk)-[:NEXT]->(:Chunk)`
+  - Entidades de código (`CodeFile`, `CodeEntity`) y relaciones `DEPENDS_ON`.
+- Emitir eventos de progreso para UI (`scan_complete`, `file_processing`, `profile_chunked`, `upsert_*`, `run_complete`).
+
+Notas de robustez:
+
+- Si Neo4j no está configurado o no conecta, la ingesta sigue en modo vectorial.
+- En errores `BadRequestError` de embeddings, divide lotes/chunks en vez de abortar proceso.
+
+### 2) Consulta (`app.py`)
+
+Componente principal: UI Streamlit + retrieval híbrido.
+
+Pipeline de consulta:
+
+- Stage 1 (alta cobertura):
+  - Clasifica intención (`listing`, `counting`, `impact_analysis`, `bug_rootcause`, `architecture`, `security`, `performance`, `refactor_plan`, `how_it_works`).
+  - Expande consulta y recupera candidatos con `top-k` por colección.
+- Stage 2 (calidad):
+  - Reranking por score compuesto (distancia + señales léxicas).
+  - MMR para balancear relevancia y diversidad de evidencia.
+- En paralelo:
+  - Recupera evidencia estructural desde Neo4j por keywords y continuidad `prev/next`.
+- Fusión:
+  - Combina evidencia vectorial + estructural, deduplica y genera prompt final para OpenAI.
+
+Diagnóstico de retrieval disponible en UI:
+
+- `intent`, `stage1_k`, `stage1_raw`, `stage1_deduped`
+- `stage2_scored`, `stage2_final`, `stage2_mmr_lambda`
+- conteo de fuentes únicas recuperadas
+
+### 3) Diagrama de solución (RAG Híbrido)
+
+```mermaid
+flowchart LR
+    A[Fuentes: PDF/Excel/Código/Repo GitHub] --> B[Ingesta: KDBIngestor]
+    B --> C[Chunking por estrategia]
+    C --> D[Embeddings OpenAI]
+    D --> E[(ChromaDB)]
+    C --> F[(Neo4j)]
+
+    Q[Pregunta del usuario] --> G[Stage 1: Recall alto]
+    G --> E
+    G --> H[Stage 2: Reranking MMR]
+    H --> I[Evidencia vectorial final]
+
+    Q --> J[Consulta estructural por keywords]
+    J --> F
+    F --> K[Evidencia estructural]
+
+    I --> L[Fusión + deduplicación]
+    K --> L
+    L --> M[Prompt final]
+    M --> N[OpenAI gpt-4o]
+    N --> O[Respuesta en español con trazabilidad]
+```
+
+### 4) Secuencia operacional (paso a paso)
+
+1. Usuario sube archivos, ZIP, carpeta local o URL GitHub.
+2. `KDBIngestor.run()` obtiene documentos y emite `scan_complete`.
+3. Para cada archivo soportado:
+   - detecta tipo
+   - aplica chunking
+   - emite `file_processing` y `profile_chunked`
+4. Upsert en lotes a Chroma:
+   - controla límites de tokens/chars
+   - si falla un lote, divide y reintenta (`upsert_split_batch`)
+5. Indexación estructural en Neo4j (si disponible).
+6. Usuario realiza consulta en chat.
+7. `app.py` ejecuta Stage 1 + Stage 2 y consulta grafo.
+8. Se combina evidencia, se construye prompt y se invoca OpenAI.
+9. UI muestra respuesta y diagnóstico de recuperación.
+
+---
+
+## ✂️ Estrategias de chunking
+
+El sistema soporta estrategias seleccionables y perfiles por colección.
+
+Estrategias disponibles:
+
+- `char_overlap`: ventanas por caracteres con solapamiento.
+- `sentence_window`: ventanas por oraciones con solapamiento de contexto.
+- `paragraph_window`: agrupación por párrafos adyacentes.
+- `heading_window`: segmentación guiada por encabezados.
+- `code_aware`: segmentación orientada a bloques/código.
+
+Perfiles activos (multi-colección):
+
+- `kdb_small`: `sentence_window`, chunks más pequeños para precisión semántica.
+- `kdb_large`: `char_overlap`, chunks grandes para cobertura/contexto.
+- `kdb_code`: `code_aware`, optimizado para repositorios y dependencias.
+
+Controles de seguridad de embedding:
+
+- límite de tokens por batch
+- límite de caracteres por batch
+- límite de tokens/caracteres por chunk
+- división recursiva ante overflow
+
+---
+
+## 📁 Estructura del proyecto
+
+```text
+.
+├── app.py
+├── ingestion.py
+├── pydantic_patch.py
+├── requirements.txt
+├── readme.md
+├── Prompt.md
+├── docker-compose.neo4j.yml
+├── scripts/
+│   ├── check_neo4j.py
+│   ├── github_loader.py
+│   └── setup_neo4j.ps1
+├── tests/
+│   └── test_ingestion_unit.py
+├── documentos_fuente/
+│   └── ...
+└── db_chroma_kdb/
+    └── ...
+```
+
+Descripción rápida:
+
+- `app.py`: UI Streamlit, retrieval híbrido y generación de respuestas.
+- `ingestion.py`: pipeline de ingesta, chunking, indexación Chroma/Neo4j.
+- `scripts/github_loader.py`: clonación/limpieza de repositorios para ingesta.
+- `scripts/check_neo4j.py`: prueba de conectividad Neo4j.
+- `tests/test_ingestion_unit.py`: pruebas unitarias de helpers críticos de ingesta.
+
+---
+
+## 🔐 Variables de entorno
+
+Esperadas en `.env`:
+
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL` (opcional)
+- `NEO4J_URI`
+- `NEO4J_USER`
+- `NEO4J_PASSWORD`
+- `NEO4J_DATABASE`
+
+---
+
+## 🧪 Validación recomendada
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests/test_ingestion_unit.py
+```
+
+Para verificar conectividad de grafo:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\check_neo4j.py
+```
+
+---
+
+## 🛠️ Problemas comunes
+
+- Error de lock en `db_chroma_kdb/chroma.sqlite3` en Windows:
+  - cerrar procesos Python/Streamlit
+  - limpiar carpeta `db_chroma_kdb`
+  - reiniciar app
+- Si Neo4j no conecta:
+  - el sistema sigue en modo vectorial
+  - revisar variables de entorno y credenciales
