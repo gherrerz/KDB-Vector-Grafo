@@ -1151,21 +1151,20 @@ class KDBIngestor:
                     ) as f:
                         text = f.read()
                     if text.strip():
+                        detected_type = self._detect_file_type(
+                            os.path.basename(rel_path)
+                        )
                         documents.append({
                             "page_content": text,
                             "metadata": {
                                 "source": rel_path,
-                                "file_type": self._detect_file_type(
-                                    os.path.basename(rel_path)
-                                ),
+                                "file_type": detected_type,
                             }
                         })
                         self._emit_progress(
                             "file_loaded",
                             file=rel_path,
-                            file_type=self._detect_file_type(
-                                os.path.basename(rel_path)
-                            ),
+                            file_type=detected_type,
                             records=1,
                         )
                     else:

@@ -320,11 +320,86 @@ def consultar_evidencia_kdb(
     query: str,
     strategy_filter: str = "all",
     collection_filter: str = "all",
-    per_collection_k: int = 4
+    per_collection_k: int = 4,
+    max_final_results: int = 8,
 ) -> list[dict[str, Any]]:
-    """Busca en colecciones ChromaDB y permite filtrar por metadatos."""
+    """Wrapper compatible para recuperar resultados de Stage 2."""
+    return _retrieve_vector_stage2(
+        query=query,
+        strategy_filter=strategy_filter,
+        collection_filter=collection_filter,
+        per_collection_k=per_collection_k,
+        max_final_results=max_final_results,
+    )["results"]
+
+
+def _classify_query_intent(query: str) -> str:
+    """Clasifica intención de consulta para ajustar retrieval."""
+    query_lower = query.lower()
+    if any(token in query_lower for token in ["impacto", "afecta", "depende", "blast radius"]):
+        return "impact_analysis"
+    if any(token in query_lower for token in ["error", "bug", "falla", "fallo", "exception", "traceback"]):
+        return "bug_rootcause"
+    if any(token in query_lower for token in ["seguridad", "vulnerabilidad", "inyeccion", "xss", "auth"]):
+        return "security"
+    if any(token in query_lower for token in ["performance", "rendimiento", "latencia", "optimizar"]):
+        return "performance"
+    if any(token in query_lower for token in ["refactor", "refactorizar", "restructurar", "modularizar"]):
+        return "refactor_plan"
+    if any(
+        token in query_lower
+        for token in ["todos", "todas", "listar", "listado", "cuales", "cuáles"]
+    ):
+        return "listing"
+    if any(token in query_lower for token in ["cuantos", "cuántos", "total", "cantidad"]):
+        return "counting"
+    if any(token in query_lower for token in ["arquitectura", "componentes", "módulos", "modulos"]):
+        return "architecture"
+    return "how_it_works"
+
+
+def _build_query_expansions(query: str, intent: str) -> list[str]:
+    """Genera expansiones simples para mejorar recall en Stage 1."""
+    expansions = [query]
+    keywords = _extraer_keywords(query)
+    if keywords:
+        expansions.append(" ".join(keywords[:6]))
+    if intent in {"listing", "counting"} and len(keywords) >= 2:
+        expansions.append(" ".join(keywords[:2]))
+
+    unique: list[str] = []
+    seen = set()
+    for item in expansions:
+        normalized = item.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(item)
+    return unique
+
+
+def _resolve_stage1_k(intent: str, per_collection_k: int) -> int:
+    """Define tamaño de recuperación Stage 1 según intención."""
+    base = max(2, per_collection_k)
+    if intent in {"listing", "counting"}:
+        return max(20, base * 4)
+    if intent in {"impact_analysis", "architecture"}:
+        return max(12, base * 3)
+    if intent in {"security", "performance", "refactor_plan"}:
+        return max(14, base * 3)
+    return max(10, base * 2)
+
+
+def _retrieve_stage1_candidates(
+    query: str,
+    strategy_filter: str,
+    collection_filter: str,
+    per_collection_k: int,
+    intent: str,
+) -> dict[str, Any]:
+    """Stage 1: recuperación de alta cobertura por colección."""
     if not vector_stores:
-        return []
+        return {"results": [], "stats": {"intent": intent, "stage1_k": 0}}
 
     if collection_filter != "all" and collection_filter in vector_stores:
         target_collections = {
@@ -332,57 +407,245 @@ def consultar_evidencia_kdb(
     elif collection_filter == "all":
         target_collections = vector_stores
     else:
-        return []
+        return {"results": [], "stats": {"intent": intent, "stage1_k": 0}}
 
     where = None
     if strategy_filter != "all":
         where = {"chunk_strategy": strategy_filter}
 
+    stage1_k = _resolve_stage1_k(intent, per_collection_k)
+    expanded_queries = _build_query_expansions(query, intent)
     all_docs: list[dict[str, Any]] = []
+
     for collection_name, collection in target_collections.items():
-        try:
-            query_args = {
-                "query_texts": [query],
-                "n_results": per_collection_k
-            }
-            if where:
-                query_args["where"] = where
+        for expanded_query in expanded_queries:
+            try:
+                query_args = {
+                    "query_texts": [expanded_query],
+                    "n_results": stage1_k,
+                }
+                if where:
+                    query_args["where"] = where
 
-            results = collection.query(**query_args)
-            documents = results.get("documents", [[]])[0]
-            metadatas = results.get("metadatas", [[]])[0]
-            distances = results.get("distances", [[]])[
-                0] if results.get("distances") else []
+                results = collection.query(**query_args)
+                documents = results.get("documents", [[]])[0]
+                metadatas = results.get("metadatas", [[]])[0]
+                distances = results.get("distances", [[]])[0] if results.get("distances") else []
 
-            for i, text in enumerate(documents):
-                metadata = metadatas[i] if i < len(metadatas) else {}
-                distance = distances[i] if i < len(distances) else None
-                all_docs.append({
-                    "text": text,
-                    "source": metadata.get("source", ""),
-                    "collection": metadata.get("collection", collection_name),
-                    "chunk_strategy": metadata.get("chunk_strategy", ""),
-                    "parent_id": metadata.get("parent_id", ""),
-                    "file_type": metadata.get("file_type", ""),
-                    "distance": distance
-                })
-        except (AttributeError, TypeError, ValueError):
+                for i, text in enumerate(documents):
+                    metadata = metadatas[i] if i < len(metadatas) else {}
+                    distance = distances[i] if i < len(distances) else None
+                    all_docs.append({
+                        "text": text,
+                        "source": metadata.get("source", ""),
+                        "collection": metadata.get("collection", collection_name),
+                        "chunk_strategy": metadata.get("chunk_strategy", ""),
+                        "parent_id": metadata.get("parent_id", ""),
+                        "file_type": metadata.get("file_type", ""),
+                        "distance": distance,
+                        "retrieved_with": expanded_query,
+                    })
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+    deduped_stage1 = []
+    seen_stage1 = set()
+    for item in all_docs:
+        key = item.get("parent_id") or (item.get("source", ""), item.get("text", "")[:220])
+        if key in seen_stage1:
             continue
+        seen_stage1.add(key)
+        deduped_stage1.append(item)
 
-    all_docs = sorted(all_docs, key=lambda x: x.get("distance")
-                      if x.get("distance") is not None else 999)
+    return {
+        "results": deduped_stage1,
+        "stats": {
+            "intent": intent,
+            "stage1_k": stage1_k,
+            "expanded_queries": expanded_queries,
+            "stage1_raw": len(all_docs),
+            "stage1_deduped": len(deduped_stage1),
+        },
+    }
 
-    deduped = []
-    seen = set()
-    for d in all_docs:
-        key = d.get("parent_id") or (
-            d.get("source", ""), d.get("text", "")[:200])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(d)
 
-    return deduped[:8]
+def _score_stage2_candidate(
+    item: dict[str, Any],
+    query_keywords: list[str],
+    intent: str,
+) -> float:
+    """Calcula score de Stage 2 combinando similitud y señales léxicas."""
+    text = (item.get("text", "") or "").lower()
+    source = (item.get("source", "") or "").lower()
+    distance = item.get("distance")
+
+    if isinstance(distance, (int, float)):
+        clipped = max(0.0, min(float(distance), 2.0))
+        distance_score = 1.0 - (clipped / 2.0)
+    else:
+        distance_score = 0.20
+
+    if query_keywords:
+        text_hits = sum(1 for keyword in query_keywords if keyword in text)
+        source_hits = sum(1 for keyword in query_keywords if keyword in source)
+        keyword_score = text_hits / len(query_keywords)
+        source_score = source_hits / len(query_keywords)
+    else:
+        keyword_score = 0.0
+        source_score = 0.0
+
+    if intent in {"listing", "counting"}:
+        return (0.30 * distance_score) + (0.55 * keyword_score) + (0.15 * source_score)
+    return (0.55 * distance_score) + (0.35 * keyword_score) + (0.10 * source_score)
+
+
+def _tokenize_for_mmr(text: str) -> set[str]:
+    """Tokeniza texto para similitud léxica en MMR."""
+    return set(re.findall(r"[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9_]{3,}", (text or "").lower()))
+
+
+def _jaccard_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
+    """Calcula similitud de Jaccard entre dos conjuntos de tokens."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = len(tokens_a.intersection(tokens_b))
+    union = len(tokens_a.union(tokens_b))
+    if union == 0:
+        return 0.0
+    return intersection / union
+
+
+def _resolve_mmr_lambda(intent: str) -> float:
+    """Define balance relevancia/diversidad para MMR según intención."""
+    if intent in {"listing", "counting"}:
+        return 0.35
+    if intent in {"impact_analysis", "architecture", "refactor_plan"}:
+        return 0.50
+    if intent in {"security", "performance"}:
+        return 0.58
+    return 0.62
+
+
+def _rerank_stage2(
+    candidates: list[dict[str, Any]],
+    query: str,
+    intent: str,
+    max_final_results: int,
+) -> dict[str, Any]:
+    """Stage 2: reranking MMR (relevancia + diversidad)."""
+    if not candidates:
+        return {"results": [], "stats": {"stage2_scored": 0, "stage2_final": 0}}
+
+    query_keywords = _extraer_keywords(query)
+    scored = []
+    for item in candidates:
+        score = _score_stage2_candidate(item, query_keywords, intent)
+        scored.append({**item, "stage2_score": score})
+
+    scored.sort(
+        key=lambda row: (
+            row.get("stage2_score", 0.0),
+            -len((row.get("text", "") or "")),
+        ),
+        reverse=True,
+    )
+
+    safe_max = max(1, max_final_results)
+    if len(scored) <= safe_max:
+        return {
+            "results": scored,
+            "stats": {
+                "stage2_scored": len(scored),
+                "stage2_final": len(scored),
+                "stage2_mmr_lambda": _resolve_mmr_lambda(intent),
+            },
+        }
+
+    candidate_pool = []
+    for item in scored:
+        content = " ".join([
+            item.get("source", "") or "",
+            item.get("text", "") or "",
+        ])
+        candidate_pool.append({
+            **item,
+            "_mmr_tokens": _tokenize_for_mmr(content),
+        })
+
+    selected: list[dict[str, Any]] = []
+    lambda_mmr = _resolve_mmr_lambda(intent)
+
+    while candidate_pool and len(selected) < safe_max:
+        best_idx = 0
+        best_mmr_score = float("-inf")
+
+        for idx, candidate in enumerate(candidate_pool):
+            relevance = float(candidate.get("stage2_score", 0.0))
+            if not selected:
+                diversity_penalty = 0.0
+            else:
+                max_similarity = max(
+                    _jaccard_similarity(
+                        candidate.get("_mmr_tokens", set()),
+                        selected_item.get("_mmr_tokens", set()),
+                    )
+                    for selected_item in selected
+                )
+                diversity_penalty = max_similarity
+
+            mmr_score = (lambda_mmr * relevance) - (
+                (1.0 - lambda_mmr) * diversity_penalty
+            )
+            if mmr_score > best_mmr_score:
+                best_mmr_score = mmr_score
+                best_idx = idx
+
+        chosen = candidate_pool.pop(best_idx)
+        chosen["stage2_mmr_score"] = best_mmr_score
+        selected.append(chosen)
+
+    for item in selected:
+        item.pop("_mmr_tokens", None)
+
+    return {
+        "results": selected,
+        "stats": {
+            "stage2_scored": len(scored),
+            "stage2_final": len(selected),
+            "stage2_mmr_lambda": lambda_mmr,
+        },
+    }
+
+
+def _retrieve_vector_stage2(
+    query: str,
+    strategy_filter: str,
+    collection_filter: str,
+    per_collection_k: int,
+    max_final_results: int,
+) -> dict[str, Any]:
+    """Pipeline vectorial completo en 2 etapas."""
+    intent = _classify_query_intent(query)
+    stage1 = _retrieve_stage1_candidates(
+        query=query,
+        strategy_filter=strategy_filter,
+        collection_filter=collection_filter,
+        per_collection_k=per_collection_k,
+        intent=intent,
+    )
+    stage2 = _rerank_stage2(
+        candidates=stage1.get("results", []),
+        query=query,
+        intent=intent,
+        max_final_results=max_final_results,
+    )
+    return {
+        "results": stage2.get("results", []),
+        "stats": {
+            **stage1.get("stats", {}),
+            **stage2.get("stats", {}),
+        },
+    }
 
 
 def _extraer_keywords(query: str) -> list[str]:
@@ -453,14 +716,19 @@ def consultar_evidencia_grafo(
 def recuperar_evidencia_hibrida(
     query: str,
     strategy_filter: str = "all",
-    collection_filter: str = "all"
+    collection_filter: str = "all",
+    per_collection_k: int = 4,
+    max_final_results: int = 8,
 ) -> dict[str, list[dict[str, Any]]]:
     """Combina evidencia semántica de Chroma con evidencia de Neo4j."""
-    evidencia_vector = consultar_evidencia_kdb(
-        query,
+    vector_pipeline = _retrieve_vector_stage2(
+        query=query,
         strategy_filter=strategy_filter,
-        collection_filter=collection_filter
+        collection_filter=collection_filter,
+        per_collection_k=per_collection_k,
+        max_final_results=max_final_results,
     )
+    evidencia_vector = vector_pipeline.get("results", [])
     evidencia_grafo = consultar_evidencia_grafo(query)
 
     combined = []
@@ -481,21 +749,29 @@ def recuperar_evidencia_hibrida(
     return {
         "vector": evidencia_vector,
         "graph": evidencia_grafo,
-        "combined": combined
+        "combined": combined,
+        "retrieval_stats": vector_pipeline.get("stats", {}),
     }
 
 
 def generar_respuesta(
     user_question: str,
     strategy_filter: str = "all",
-    collection_filter: str = "all"
+    collection_filter: str = "all",
+    per_collection_k: int = 4,
+    max_final_results: int = 8,
+    evidencia_precomputada: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     """Genera una respuesta final usando contexto híbrido y OpenAI."""
-    evidencia = recuperar_evidencia_hibrida(
-        user_question,
-        strategy_filter=strategy_filter,
-        collection_filter=collection_filter
-    )
+    evidencia = evidencia_precomputada
+    if evidencia is None:
+        evidencia = recuperar_evidencia_hibrida(
+            user_question,
+            strategy_filter=strategy_filter,
+            collection_filter=collection_filter,
+            per_collection_k=per_collection_k,
+            max_final_results=max_final_results,
+        )
 
     evidencia_semantica = "\n\n".join(
         [
@@ -615,6 +891,30 @@ with st.sidebar:
         "Colección",
         collection_options,
         index=0
+    )
+    retrieval_k = st.slider(
+        "Resultados por colección (top-k)",
+        min_value=2,
+        max_value=30,
+        value=12,
+        step=1,
+        help=(
+            "Sube este valor si la consulta necesita cobertura completa "
+            "(por ejemplo: listar todos los DAO)."
+        ),
+    )
+    retrieval_max = st.slider(
+        "Máximo evidencia combinada",
+        min_value=4,
+        max_value=60,
+        value=24,
+        step=1,
+        help="Cantidad máxima de evidencias únicas que pasan al prompt.",
+    )
+    debug_query_mode = st.checkbox(
+        "Modo diagnóstico de consulta",
+        value=True,
+        help="Muestra cuántos chunks/fuentes se recuperan antes de responder.",
     )
 
     if st.button("🧹 Limpiar fuente e índices"):
@@ -952,10 +1252,21 @@ if user_input := st.chat_input("Consulta la base de conocimientos..."):
     with st.chat_message("assistant"):
         with st.spinner("El Auditor está analizando la evidencia..."):
             try:
+                evidencia_debug = recuperar_evidencia_hibrida(
+                    user_input,
+                    strategy_filter=selected_strategy,
+                    collection_filter=selected_collection,
+                    per_collection_k=retrieval_k,
+                    max_final_results=retrieval_max,
+                )
+
                 response_text = generar_respuesta(
                     user_input,
                     strategy_filter=selected_strategy,
-                    collection_filter=selected_collection
+                    collection_filter=selected_collection,
+                    per_collection_k=retrieval_k,
+                    max_final_results=retrieval_max,
+                    evidencia_precomputada=evidencia_debug,
                 )
             except (
                 APIError,
@@ -968,6 +1279,46 @@ if user_input := st.chat_input("Consulta la base de conocimientos..."):
                 RuntimeError,
             ) as e:
                 response_text = f"❌ Error al generar respuesta: {str(e)}"
+
+            if debug_query_mode and "evidencia_debug" in locals():
+                vector_docs = evidencia_debug.get("vector", [])
+                graph_docs = evidencia_debug.get("graph", [])
+                combined_docs = evidencia_debug.get("combined", [])
+                retrieval_stats = evidencia_debug.get("retrieval_stats", {})
+                unique_sources = sorted(
+                    {
+                        item.get("source", "")
+                        for item in combined_docs
+                        if item.get("source", "")
+                    }
+                )
+                with st.expander("🧪 Diagnóstico de consulta", expanded=False):
+                    st.write(
+                        f"Vector: {len(vector_docs)} | "
+                        f"Grafo: {len(graph_docs)} | "
+                        f"Combinado: {len(combined_docs)}"
+                    )
+                    st.write(
+                        "Intent: "
+                        f"{retrieval_stats.get('intent', 'n/a')} | "
+                        "Stage1_k: "
+                        f"{retrieval_stats.get('stage1_k', 0)} | "
+                        "S1 raw/dedup: "
+                        f"{retrieval_stats.get('stage1_raw', 0)}/"
+                        f"{retrieval_stats.get('stage1_deduped', 0)} | "
+                        "S2 final: "
+                        f"{retrieval_stats.get('stage2_final', 0)}"
+                    )
+                    st.write(
+                        f"top-k por colección: {retrieval_k} | "
+                        f"máx evidencia: {retrieval_max}"
+                    )
+                    if unique_sources:
+                        st.write("Fuentes recuperadas:")
+                        st.code("\n".join(unique_sources[:120]), language="text")
+                    else:
+                        st.write("Sin fuentes recuperadas para esta consulta.")
+
             st.markdown(response_text)
             st.session_state.messages.append(
                 {"role": "assistant", "content": response_text})
