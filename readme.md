@@ -103,5 +103,33 @@ La app mostrará la URL local en la consola de Streamlit (ej. `http://localhost:
 
 ---
 
+## 🧪 Calidad técnica (Checklist antes/después)
+
+Fecha de corte: **3-mar-2026**
+
+### Antes
+
+- [ ] Docstrings faltantes en funciones/clases clave de `app.py` e `ingestion.py`.
+- [ ] Uso extendido de `except Exception` y bloques silenciosos (`pass`).
+- [ ] Varias líneas por encima de 79 caracteres (PEP 8).
+- [ ] Ausencia de tests unitarios para helpers críticos de ingesta/chunking.
+- [ ] Trazabilidad inconsistente por uso de `print` en utilidades/scripts.
+
+### Después
+
+- [x] Docstrings: **0 faltantes** en archivos Python principales auditados.
+- [x] Excepciones genéricas: eliminadas de los módulos principales (`except Exception` -> 0 en el barrido).
+- [x] PEP 8 (79 columnas): `app.py` = 0 y `ingestion.py` = 0 líneas fuera de límite.
+- [x] Tests unitarios: suite activa con **9 tests OK** (`python -m unittest discover -s tests -p "test_*.py"`).
+- [x] Mejor trazabilidad: reemplazo de `print` por `logging` en scripts y flujo de ingesta.
+
+### Evidencia de validación
+
+- [x] `get_errors`: sin errores en `app.py`, `ingestion.py`, `pydantic_patch.py`, `scripts/check_neo4j.py`, `scripts/github_loader.py`.
+- [x] Recuento automático de docstrings y líneas >79 ejecutado en terminal.
+- [x] Ejecución de pruebas automatizadas completada en verde.
+
+---
+
 Si quieres, actualizo este README con un `README_RUN.md` con comandos y recomendaciones para migrar a Python 3.13 y cómo limpiar los parches locales en el `venv`.
 ```

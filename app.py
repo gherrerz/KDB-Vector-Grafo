@@ -1,3 +1,19 @@
+"""Aplicación Streamlit para auditoría con RAG híbrido (ChromaDB + Neo4j)."""
+
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
+from neo4j import Driver
+from neo4j import GraphDatabase
+from chromadb.utils import embedding_functions
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    RateLimitError,
+)
+import chromadb
+import openai
 import streamlit as st
 import os
 import re
@@ -5,6 +21,10 @@ import io
 import shutil
 import zipfile
 import gc
+import logging
+
+from typing import Any
+
 from ingestion import KDBIngestor
 from dotenv import load_dotenv
 
@@ -12,10 +32,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- IMPORTS ---
-import openai
-import chromadb
-from chromadb.utils import embedding_functions
-from neo4j import GraphDatabase
 # no langchain dependencies, use simple retrieval and OpenAI API
 
 # --- CONFIGURACIÓN DE RUTAS ---
@@ -24,7 +40,8 @@ CHROMA_PATH = "./db_chroma_kdb"
 os.makedirs(DATA_PATH, exist_ok=True)
 
 DEFAULT_COLLECTIONS = ["kdb_principal", "kdb_small", "kdb_large", "kdb_code"]
-STRATEGY_OPTIONS = ["all", "char_overlap", "sentence_window", "paragraph_window", "heading_window", "code_aware"]
+STRATEGY_OPTIONS = ["all", "char_overlap", "sentence_window",
+                    "paragraph_window", "heading_window", "code_aware"]
 
 NEO4J_URI = os.getenv("NEO4J_URI", "")
 NEO4J_USER = os.getenv("NEO4J_USER", "")
@@ -32,27 +49,42 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 # Configuración de página
-st.set_page_config(page_title="Auditor KDB Pro", layout="wide", page_icon="🕵️‍♂️")
+st.set_page_config(page_title="Auditor KDB Pro",
+                   layout="wide", page_icon="🕵️‍♂️")
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _copiar_carpeta_recursiva(origen: str, destino_base: str) -> int:
+    """Copia una carpeta completa dentro de `destino_base` recursivamente."""
     origen_abs = os.path.abspath(origen)
     destino_abs = os.path.abspath(destino_base)
 
     if not os.path.isdir(origen_abs):
         raise ValueError(f"La ruta no es una carpeta válida: {origen}")
 
-    if origen_abs == destino_abs or origen_abs.startswith(destino_abs + os.sep):
-        raise ValueError("La carpeta origen no puede estar dentro de documentos_fuente.")
+    if origen_abs == destino_abs or origen_abs.startswith(
+            destino_abs + os.sep):
+        raise ValueError(
+            "La carpeta origen no puede estar dentro de documentos_fuente.")
 
     base_name = os.path.basename(origen_abs.rstrip("\\/"))
     copied = 0
     ignored_dirs = {
-        ".git", ".svn", ".hg", "__pycache__", ".venv", "venv", "node_modules", ".idea", ".vscode"
-    }
+        ".git",
+        ".svn",
+        ".hg",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".idea",
+        ".vscode"}
 
     for root, dirs, files in os.walk(origen_abs, topdown=True):
-        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+        dirs[:] = [
+            d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
         rel = os.path.relpath(root, origen_abs)
         for file_name in files:
             src = os.path.join(root, file_name)
@@ -66,14 +98,15 @@ def _copiar_carpeta_recursiva(origen: str, destino_base: str) -> int:
                 shutil.copy2(src, dst)
                 copied += 1
             except PermissionError:
-                print(f"⚠️ Permiso denegado al copiar: {src}")
-            except OSError as e:
-                print(f"⚠️ No se pudo copiar {src}: {e}")
+                LOGGER.warning("⚠️ Permiso denegado al copiar: %s", src)
+            except OSError as exc:
+                LOGGER.warning("⚠️ No se pudo copiar %s: %s", src, exc)
 
     return copied
 
 
-def _extraer_zip_recursivo(uploaded_file, destino_base: str) -> int:
+def _extraer_zip_recursivo(uploaded_file: Any, destino_base: str) -> int:
+    """Extrae un archivo ZIP cargado por Streamlit en `destino_base`."""
     data = uploaded_file.getvalue()
     extracted = 0
 
@@ -90,14 +123,17 @@ def _extraer_zip_recursivo(uploaded_file, destino_base: str) -> int:
             dst = os.path.join(destino_base, *parts)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
 
-            with zf.open(member, "r") as src_stream, open(dst, "wb") as dst_stream:
+            with zf.open(member, "r") as src_stream, open(
+                dst, "wb"
+            ) as dst_stream:
                 shutil.copyfileobj(src_stream, dst_stream)
             extracted += 1
 
     return extracted
 
 
-def _limpiar_directorio(path: str):
+def _limpiar_directorio(path: str) -> None:
+    """Elimina el contenido de un directorio preservando la carpeta raíz."""
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
         return
@@ -113,18 +149,20 @@ def _limpiar_directorio(path: str):
                 pass
 
 
-def _reset_neo4j():
+def _reset_neo4j() -> bool:
+    """Borra el grafo completo de Neo4j cuando la conexión está disponible."""
     if neo4j_driver is None:
         return False
     try:
         with neo4j_driver.session(database=NEO4J_DATABASE) as session:
             session.run("MATCH (n) DETACH DELETE n")
         return True
-    except Exception:
+    except (Neo4jError, ServiceUnavailable):
         return False
 
 
 def _reset_chroma_collections() -> int:
+    """Elimina las colecciones `kdb_*` del cliente Chroma actual."""
     global vector_stores
     if chroma_client is None:
         return 0
@@ -132,7 +170,7 @@ def _reset_chroma_collections() -> int:
     deleted = 0
     try:
         existing = chroma_client.list_collections()
-    except Exception:
+    except (AttributeError, ValueError, RuntimeError):
         return 0
 
     for item in existing:
@@ -144,7 +182,7 @@ def _reset_chroma_collections() -> int:
         try:
             chroma_client.delete_collection(name)
             deleted += 1
-        except Exception:
+        except (AttributeError, ValueError, RuntimeError):
             continue
 
     vector_stores = {}
@@ -152,12 +190,13 @@ def _reset_chroma_collections() -> int:
 
 
 def _limpieza_profunda_chroma() -> tuple[bool, str]:
+    """Reinicia la carpeta de ChromaDB y limpia estado en memoria."""
     global chroma_client, vector_stores
     mensaje = ""
 
     try:
         _reset_chroma_collections()
-    except Exception:
+    except (AttributeError, ValueError, RuntimeError):
         pass
 
     vector_stores = {}
@@ -169,18 +208,21 @@ def _limpieza_profunda_chroma() -> tuple[bool, str]:
             shutil.rmtree(CHROMA_PATH)
         os.makedirs(CHROMA_PATH, exist_ok=True)
         return True, "db_chroma_kdb borrado y recreado"
-    except Exception as e:
+    except OSError as exc:
         mensaje = (
             "Windows mantiene lock sobre chroma.sqlite3. "
             "Cierra la app y ejecuta: "
             "Remove-Item .\\db_chroma_kdb -Recurse -Force; "
             "New-Item .\\db_chroma_kdb -ItemType Directory"
         )
-        return False, f"{mensaje}. Detalle: {e}"
+        return False, f"{mensaje}. Detalle: {exc}"
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
+
+
 @st.cache_resource
-def init_vector_stores():
+def init_vector_stores() -> tuple[Any, dict[str, Any]]:
+    """Inicializa cliente Chroma y colecciones de trabajo disponibles."""
     if not os.getenv("OPENAI_API_KEY"):
         st.error("❌ API Key no encontrada. Configura el archivo .env")
         st.stop()
@@ -196,15 +238,15 @@ def init_vector_stores():
             name = getattr(item, "name", None)
             if name and name.startswith("kdb_"):
                 collection_names.add(name)
-    except Exception:
-        pass
+    except (AttributeError, ValueError, RuntimeError) as exc:
+        LOGGER.warning("No se pudo listar colecciones de Chroma: %s", exc)
 
     collections = {}
     for name in sorted(collection_names):
-        try:
-            collections[name] = client.get_collection(name, embedding_function=embedding_fn)
-        except Exception:
-            continue
+        collections[name] = client.get_or_create_collection(
+            name=name,
+            embedding_function=embedding_fn,
+        )
 
     if not collections:
         collections["kdb_principal"] = client.create_collection(
@@ -216,16 +258,19 @@ def init_vector_stores():
 
 
 @st.cache_resource
-def init_neo4j_driver():
+def init_neo4j_driver() -> Driver | None:
+    """Inicializa el driver de Neo4j y valida conectividad."""
     if not (NEO4J_URI and NEO4J_USER and NEO4J_PASSWORD):
         return None
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        driver = GraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         with driver.session(database=NEO4J_DATABASE) as session:
             session.run("RETURN 1")
         return driver
-    except Exception:
+    except (Neo4jError, ServiceUnavailable):
         return None
+
 
 chroma_client, vector_stores = init_vector_stores()
 neo4j_driver = init_neo4j_driver()
@@ -236,27 +281,34 @@ neo4j_driver = init_neo4j_driver()
 # initialize OpenAI client (new 1.0+ interface)
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-system_prompt = """Eres un Auditor Técnico experto y Analista de Datos. Tu objetivo es analizar la base de conocimientos proporcionada.
+system_prompt = """Eres un Auditor Técnico experto y Analista de Datos.
+Tu objetivo es analizar la base de conocimientos proporcionada.
 
 REGLAS DE ORO:
 1. IDIOMA: Responde siempre en ESPAÑOL profesional.
-2. RIGOR: Si los datos provienen de una tabla, interprétalos con precisión quirúrgica.
-3. CITACIÓN: Menciona siempre el nombre del archivo fuente (p.ej., 'Según reporte_final.pdf, página 4...').
-4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos, di: 'No se encontraron registros suficientes para validar esta información'.
+2. RIGOR: Si los datos provienen de una tabla,
+    interprétalos con precisión quirúrgica.
+3. CITACIÓN: Menciona siempre el nombre del archivo fuente
+    (p.ej., 'Según reporte_final.pdf, página 4...').
+4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos,
+    di: 'No se encontraron registros suficientes para validar
+    esta información'.
 """
+
 
 def consultar_evidencia_kdb(
     query: str,
     strategy_filter: str = "all",
     collection_filter: str = "all",
     per_collection_k: int = 4
-) -> list[dict]:
-    """Busca en una o varias colecciones ChromaDB y permite filtrar por metadatos."""
+) -> list[dict[str, Any]]:
+    """Busca en colecciones ChromaDB y permite filtrar por metadatos."""
     if not vector_stores:
         return []
 
     if collection_filter != "all" and collection_filter in vector_stores:
-        target_collections = {collection_filter: vector_stores[collection_filter]}
+        target_collections = {
+            collection_filter: vector_stores[collection_filter]}
     elif collection_filter == "all":
         target_collections = vector_stores
     else:
@@ -266,7 +318,7 @@ def consultar_evidencia_kdb(
     if strategy_filter != "all":
         where = {"chunk_strategy": strategy_filter}
 
-    all_docs = []
+    all_docs: list[dict[str, Any]] = []
     for collection_name, collection in target_collections.items():
         try:
             query_args = {
@@ -279,7 +331,8 @@ def consultar_evidencia_kdb(
             results = collection.query(**query_args)
             documents = results.get("documents", [[]])[0]
             metadatas = results.get("metadatas", [[]])[0]
-            distances = results.get("distances", [[]])[0] if results.get("distances") else []
+            distances = results.get("distances", [[]])[
+                0] if results.get("distances") else []
 
             for i, text in enumerate(documents):
                 metadata = metadatas[i] if i < len(metadatas) else {}
@@ -293,15 +346,17 @@ def consultar_evidencia_kdb(
                     "file_type": metadata.get("file_type", ""),
                     "distance": distance
                 })
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             continue
 
-    all_docs = sorted(all_docs, key=lambda x: x.get("distance") if x.get("distance") is not None else 999)
+    all_docs = sorted(all_docs, key=lambda x: x.get("distance")
+                      if x.get("distance") is not None else 999)
 
     deduped = []
     seen = set()
     for d in all_docs:
-        key = d.get("parent_id") or (d.get("source", ""), d.get("text", "")[:200])
+        key = d.get("parent_id") or (
+            d.get("source", ""), d.get("text", "")[:200])
         if key in seen:
             continue
         seen.add(key)
@@ -311,6 +366,7 @@ def consultar_evidencia_kdb(
 
 
 def _extraer_keywords(query: str) -> list[str]:
+    """Extrae términos relevantes del texto de consulta."""
     tokens = re.findall(r"[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]{4,}", query.lower())
     stopwords = {
         "para", "como", "esta", "este", "estos", "estas", "sobre", "entre",
@@ -325,7 +381,11 @@ def _extraer_keywords(query: str) -> list[str]:
     return unique[:8]
 
 
-def consultar_evidencia_grafo(query: str, limit: int = 5) -> list[dict]:
+def consultar_evidencia_grafo(
+    query: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Recupera evidencia estructural desde Neo4j usando keywords."""
     if neo4j_driver is None:
         return []
 
@@ -355,7 +415,7 @@ def consultar_evidencia_grafo(query: str, limit: int = 5) -> list[dict]:
     try:
         with neo4j_driver.session(database=NEO4J_DATABASE) as session:
             rows = session.run(cypher, keywords=keywords, limit=limit)
-            docs = []
+            docs: list[dict[str, Any]] = []
             for row in rows:
                 docs.append({
                     "text": row.get("text", ""),
@@ -366,7 +426,7 @@ def consultar_evidencia_grafo(query: str, limit: int = 5) -> list[dict]:
                     "next_text": row.get("next_text", "")
                 })
             return docs
-    except Exception:
+    except (Neo4jError, ServiceUnavailable):
         return []
 
 
@@ -374,7 +434,8 @@ def recuperar_evidencia_hibrida(
     query: str,
     strategy_filter: str = "all",
     collection_filter: str = "all"
-) -> dict:
+) -> dict[str, list[dict[str, Any]]]:
+    """Combina evidencia semántica de Chroma con evidencia de Neo4j."""
     evidencia_vector = consultar_evidencia_kdb(
         query,
         strategy_filter=strategy_filter,
@@ -393,7 +454,8 @@ def recuperar_evidencia_hibrida(
     for item in evidencia_grafo:
         key = (item.get("source", ""), item.get("text", "")[:200])
         if key not in seen:
-            combined.append({"source": item.get("source", ""), "text": item.get("text", "")})
+            combined.append({"source": item.get("source", ""),
+                            "text": item.get("text", "")})
             seen.add(key)
 
     return {
@@ -408,6 +470,7 @@ def generar_respuesta(
     strategy_filter: str = "all",
     collection_filter: str = "all"
 ) -> str:
+    """Genera una respuesta final usando contexto híbrido y OpenAI."""
     evidencia = recuperar_evidencia_hibrida(
         user_question,
         strategy_filter=strategy_filter,
@@ -417,7 +480,8 @@ def generar_respuesta(
     evidencia_semantica = "\n\n".join(
         [
             (
-                f"Fuente: {d['source']} | Colección: {d.get('collection', '')} | "
+                f"Fuente: {d['source']} | "
+                f"Colección: {d.get('collection', '')} | "
                 f"Estrategia: {d.get('chunk_strategy', '')}\n{d['text']}"
             )
             for d in evidencia["vector"]
@@ -426,7 +490,9 @@ def generar_respuesta(
 
     evidencia_estructural = "\n\n".join([
         (
-            f"Fuente: {d['source']} | Posición: {d.get('position', 0)} | Score estructural: {d.get('score', 0)}\n"
+            f"Fuente: {d['source']} | "
+            f"Posición: {d.get('position', 0)} | "
+            f"Score estructural: {d.get('score', 0)}\n"
             f"Previo: {d.get('prev_text', '')}\n"
             f"Actual: {d.get('text', '')}\n"
             f"Siguiente: {d.get('next_text', '')}"
@@ -437,7 +503,9 @@ def generar_respuesta(
     if not evidencia_semantica:
         evidencia_semantica = "No se recuperó evidencia semántica en ChromaDB."
     if not evidencia_estructural:
-        evidencia_estructural = "No se recuperó evidencia estructural en Neo4j."
+        evidencia_estructural = (
+            "No se recuperó evidencia estructural en Neo4j."
+        )
 
     prompt = (
         f"{system_prompt}\n\n"
@@ -459,30 +527,39 @@ def generar_respuesta(
     )
     return resp.choices[0].message.content.strip()
 
+
 # --- INTERFAZ DE USUARIO (SIDEBAR) ---
 with st.sidebar:
     st.subheader("📦 Gestión de Conocimiento")
-    
+
     # Input para URL de GitHub
-    github_url = st.text_input("URL de Repositorio GitHub", placeholder="https://github.com/user/repo")
-    
+    github_url = st.text_input(
+        "URL de Repositorio GitHub",
+        placeholder="https://github.com/user/repo")
+
     if st.button("🚀 Ingestar Proyecto"):
         if github_url:
-            with st.status("Procesando repositorio...", expanded=True) as status:
+            with st.status(
+                "Procesando repositorio...", expanded=True
+            ) as status:
                 try:
                     st.write("📥 Clonando y limpiando código...")
                     # Instanciamos el ingestor con las rutas correctas
-                    ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
-                    
+                    ingestor = KDBIngestor(
+                        DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
+
                     # Llamamos al nuevo método run que acepta la URL
                     ingestor.run(github_url=github_url)
-                    
-                    status.update(label="✅ Ingesta completada!", state="complete", expanded=False)
-                    st.success("El repositorio ha sido indexado en ChromaDB y Neo4j.")
-                    
-                    # Opcional: Reiniciar estado para limpiar caché de búsqueda si fuera necesario
-                    st.rerun() 
-                except Exception as e:
+
+                    status.update(label="✅ Ingesta completada!",
+                                  state="complete", expanded=False)
+                    st.success(
+                        "El repositorio ha sido indexado en ChromaDB y Neo4j.")
+
+                    # Opcional: Reiniciar estado para limpiar caché de búsqueda
+                    # si fuera necesario
+                    st.rerun()
+                except (RuntimeError, ValueError, OSError) as e:
                     status.update(label="❌ Error en la ingesta", state="error")
                     st.error(f"Detalles: {e}")
         else:
@@ -490,13 +567,15 @@ with st.sidebar:
     st.divider()
     st.header("📥 Ingesta de Evidencia")
     if neo4j_driver is None:
-        st.warning("Neo4j no configurado. El sistema funcionará en modo vectorial.")
+        st.warning(
+            "Neo4j no configurado. El sistema funcionará en modo vectorial.")
     else:
         st.success("Neo4j conectado. Validación estructural habilitada.")
     files = st.file_uploader(
         "Browse files (archivos o .zip de carpeta)",
         accept_multiple_files=True,
-        type=["pdf", "xlsx", "xls", "zip", "txt", "md", "py", "js", "ts", "java", "json", "yml", "yaml"]
+        type=["pdf", "xlsx", "xls", "zip", "txt", "md",
+              "py", "js", "ts", "java", "json", "yml", "yaml"]
     )
     carpeta_local = st.text_input(
         "Ruta de carpeta local (opcional, carga recursiva)",
@@ -523,23 +602,32 @@ with st.sidebar:
                 st.write("🧼 documentos_fuente limpiado")
 
                 deleted_collections = _reset_chroma_collections()
-                st.write(f"🧼 Chroma limpiado ({deleted_collections} colecciones)")
+                st.write(
+                    f"🧼 Chroma limpiado ({deleted_collections} colecciones)")
 
                 neo4j_cleaned = _reset_neo4j()
                 if neo4j_cleaned:
                     st.write("🕸️ Neo4j limpiado")
                 else:
-                    st.write("ℹ️ Neo4j no estaba disponible o no se pudo limpiar")
+                    st.write(
+                        "ℹ️ Neo4j no estaba disponible "
+                        "o no se pudo limpiar"
+                    )
 
                 status.update(label="✅ Limpieza completa", state="complete")
-                st.success("Base limpia. Ya puedes cargar nueva evidencia sin duplicados.")
+                st.success(
+                    "Base limpia. Ya puedes cargar nueva evidencia "
+                    "sin duplicados."
+                )
                 st.rerun()
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 status.update(label="⚠️ Limpieza incompleta", state="error")
                 st.error(f"No se pudo completar la limpieza: {e}")
 
     if st.button("🧨 Limpieza profunda (reinicio de DB)"):
-        with st.status("Ejecutando limpieza profunda...", expanded=True) as status:
+        with st.status(
+            "Ejecutando limpieza profunda...", expanded=True
+        ) as status:
             try:
                 _limpiar_directorio(DATA_PATH)
                 st.write("🧼 documentos_fuente limpiado")
@@ -548,25 +636,34 @@ with st.sidebar:
                 if deep_ok:
                     st.write("🧼 Chroma físico reiniciado")
                 else:
-                    st.write("⚠️ No se pudo borrar físicamente la DB en caliente")
+                    st.write(
+                        "⚠️ No se pudo borrar físicamente "
+                        "la DB en caliente"
+                    )
 
                 neo4j_cleaned = _reset_neo4j()
                 if neo4j_cleaned:
                     st.write("🕸️ Neo4j limpiado")
                 else:
-                    st.write("ℹ️ Neo4j no estaba disponible o no se pudo limpiar")
+                    st.write(
+                        "ℹ️ Neo4j no estaba disponible "
+                        "o no se pudo limpiar"
+                    )
 
                 if deep_ok:
-                    status.update(label="✅ Limpieza profunda completa", state="complete")
+                    status.update(
+                        label="✅ Limpieza profunda completa", state="complete")
                     st.success("Limpieza profunda completada.")
                     st.rerun()
                 else:
-                    status.update(label="⚠️ Limpieza profunda parcial", state="error")
+                    status.update(
+                        label="⚠️ Limpieza profunda parcial", state="error")
                     st.warning(deep_msg)
-            except Exception as e:
-                status.update(label="⚠️ Limpieza profunda incompleta", state="error")
+            except (OSError, ValueError, RuntimeError) as e:
+                status.update(
+                    label="⚠️ Limpieza profunda incompleta", state="error")
                 st.error(f"No se pudo completar la limpieza profunda: {e}")
-    
+
     if st.button("🚀 Indexar Nueva Evidencia"):
         if files or carpeta_local.strip():
             with st.status("Procesando...", expanded=True) as status:
@@ -576,7 +673,8 @@ with st.sidebar:
                     if f.name.lower().endswith(".zip"):
                         count = _extraer_zip_recursivo(f, DATA_PATH)
                         total_copiados += count
-                        st.write(f"📦 ZIP extraído: {f.name} ({count} archivos)")
+                        st.write(
+                            f"📦 ZIP extraído: {f.name} ({count} archivos)")
                     else:
                         file_path = os.path.join(DATA_PATH, f.name)
                         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -585,23 +683,31 @@ with st.sidebar:
                         total_copiados += 1
 
                 if carpeta_local.strip():
-                    count = _copiar_carpeta_recursiva(carpeta_local.strip(), DATA_PATH)
+                    count = _copiar_carpeta_recursiva(
+                        carpeta_local.strip(), DATA_PATH)
                     total_copiados += count
-                    st.write(f"📁 Carpeta copiada recursivamente ({count} archivos)")
+                    st.write(
+                        f"📁 Carpeta copiada recursivamente ({count} archivos)")
 
                 st.write(f"📚 Archivos listos para indexar: {total_copiados}")
-                
-                st.write("Analizando contenido y generando embeddings + grafo (ChromaDB + Neo4j)...")
-                
-                # Pasar cliente ChromaDB en caché para evitar múltiples instancias
-                ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
+
+                st.write(
+                    "Analizando contenido y generando embeddings + "
+                    "grafo (ChromaDB + Neo4j)..."
+                )
+
+                # Pasar cliente ChromaDB en caché para evitar múltiples
+                # instancias
+                ingestor = KDBIngestor(
+                    DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
                 ingestor.run()
-                
+
                 status.update(label="✅ KDB Actualizada", state="complete")
             st.success("Archivos listos para auditoría")
             st.rerun()
         else:
-            st.warning("Sube archivos/.zip o indica una carpeta local para indexar.")
+            st.warning(
+                "Sube archivos/.zip o indica una carpeta local para indexar.")
 
     st.divider()
     if st.button("🗑️ Limpiar Historial de Chat"):
@@ -610,11 +716,20 @@ with st.sidebar:
 
 # --- PANEL DE CHAT ---
 st.title("🕵️‍♂️ Panel de Auditoría Inteligente")
-st.caption("Motor: OpenAI | RAG Híbrido: ChromaDB (semántico) + Neo4j (estructural)")
+st.caption(
+    "Motor: OpenAI | RAG Híbrido: ChromaDB (semántico) + Neo4j (estructural)")
 
 # Inicializar historial
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Listo para auditar. Sube tus archivos en la barra lateral para comenzar."}]
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Listo para auditar. Sube tus archivos en la barra lateral "
+                "para comenzar."
+            ),
+        }
+    ]
 
 # Mostrar mensajes anteriores
 for msg in st.session_state.messages:
@@ -636,7 +751,17 @@ if user_input := st.chat_input("Consulta la base de conocimientos..."):
                     strategy_filter=selected_strategy,
                     collection_filter=selected_collection
                 )
-            except Exception as e:
+            except (
+                APIError,
+                APIConnectionError,
+                APITimeoutError,
+                RateLimitError,
+                AuthenticationError,
+                BadRequestError,
+                ValueError,
+                RuntimeError,
+            ) as e:
                 response_text = f"❌ Error al generar respuesta: {str(e)}"
             st.markdown(response_text)
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
+            st.session_state.messages.append(
+                {"role": "assistant", "content": response_text})

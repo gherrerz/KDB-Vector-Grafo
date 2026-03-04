@@ -1,26 +1,47 @@
+"""Ingesta de documentos a ChromaDB y, opcionalmente, a Neo4j."""
+
 import os
 import re
 import uuid
+import logging
+from typing import Any
+
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from neo4j import Driver
+from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from scripts.github_loader import GitHubLoader
 
 # simple loaders to avoid langchain_community
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 # Cargar variables de entorno (API KEY)
 load_dotenv()
 
+
+LOGGER = logging.getLogger(__name__)
+
+
 class KDBIngestor:
-    def __init__(self, data_path, db_path, chroma_client=None):
+    """Ingestor principal para indexación vectorial y estructural."""
+
+    def __init__(
+        self,
+        data_path: str,
+        db_path: str,
+        chroma_client: Any | None = None,
+    ) -> None:
         """
         Inicializa el ingestor de la base de conocimientos.
         data_path: Carpeta donde están los documentos fuente.
         db_path: Carpeta donde se guardará la base vectorial.
-        chroma_client: Cliente ChromaDB existente (opcional). Si no se proporciona, se crea uno nuevo.
+        chroma_client: Cliente ChromaDB existente (opcional).
+        Si no se proporciona, se crea uno nuevo.
         """
         self.data_path = data_path
         self.db_path = db_path
@@ -65,7 +86,8 @@ class KDBIngestor:
             }
         ]
 
-        # Configuración de chunking (elige UNA estrategia descomentando una línea)
+        # Configuración de chunking (elige UNA estrategia descomentando una
+        # línea)
         self.chunk_strategy = "char_overlap"
         # self.chunk_strategy = "sentence_window"
         # self.chunk_strategy = "paragraph_window"
@@ -87,12 +109,38 @@ class KDBIngestor:
         self.max_embedding_tokens = 8000
 
         self.text_extensions = {
-            ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".json", ".yaml", ".yml"
-        }
+            ".txt",
+            ".md",
+            ".markdown",
+            ".rst",
+            ".log",
+            ".csv",
+            ".json",
+            ".yaml",
+            ".yml"}
         self.code_extensions = {
-            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rs", ".cpp", ".c",
-            ".h", ".hpp", ".php", ".rb", ".kt", ".swift", ".scala", ".sql", ".sh", ".ps1", ".bat"
-        }
+            ".py",
+            ".js",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".java",
+            ".cs",
+            ".go",
+            ".rs",
+            ".cpp",
+            ".c",
+            ".h",
+            ".hpp",
+            ".php",
+            ".rb",
+            ".kt",
+            ".swift",
+            ".scala",
+            ".sql",
+            ".sh",
+            ".ps1",
+            ".bat"}
 
         self.neo4j_uri = os.getenv("NEO4J_URI", "")
         self.neo4j_user = os.getenv("NEO4J_USER", "")
@@ -100,9 +148,13 @@ class KDBIngestor:
         self.neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
         self.neo4j_driver = self._init_neo4j_driver()
 
-    def _init_neo4j_driver(self):
+    def _init_neo4j_driver(self) -> Driver | None:
+        """Inicializa y valida la conexión de Neo4j."""
         if not (self.neo4j_uri and self.neo4j_user and self.neo4j_password):
-            print("ℹ️ Neo4j no configurado. Se ejecutará solo indexación vectorial.")
+            LOGGER.info(
+                "ℹ️ Neo4j no configurado. Se ejecutará "
+                "solo indexación vectorial."
+            )
             return None
         try:
             driver = GraphDatabase.driver(
@@ -111,17 +163,19 @@ class KDBIngestor:
             )
             with driver.session(database=self.neo4j_database) as session:
                 session.run("RETURN 1")
-            print("✅ Conexión con Neo4j establecida.")
+            LOGGER.info("✅ Conexión con Neo4j establecida.")
             return driver
-        except Exception as e:
-            print(f"⚠️ No se pudo conectar a Neo4j: {e}")
+        except (AuthError, ServiceUnavailable, Neo4jError) as exc:
+            LOGGER.warning("⚠️ No se pudo conectar a Neo4j: %s", exc)
             return None
 
     def _normalize_id(self, text: str) -> str:
+        """Normaliza texto para usarlo como prefijo de identificadores."""
         normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", text)
         return normalized.strip("_")[:120] or "documento"
 
-    def _index_graph(self, docs):
+    def _index_graph(self, docs: list[dict[str, Any]]) -> None:
+        """Indexa documentos y relaciones de continuidad en Neo4j."""
         if not self.neo4j_driver:
             return
 
@@ -131,7 +185,9 @@ class KDBIngestor:
             by_source.setdefault(source, []).append(item)
 
         try:
-            with self.neo4j_driver.session(database=self.neo4j_database) as session:
+            with self.neo4j_driver.session(
+                database=self.neo4j_database
+            ) as session:
                 session.run(
                     "CREATE CONSTRAINT document_name_unique IF NOT EXISTS "
                     "FOR (d:Document) REQUIRE d.name IS UNIQUE"
@@ -197,21 +253,28 @@ class KDBIngestor:
                             """,
                             rels=rels_payload
                         )
-            print("✅ Indexación estructural en Neo4j completada.")
-        except Exception as e:
-            print(f"⚠️ Error indexando en Neo4j: {e}")
+            LOGGER.info("✅ Indexación estructural en Neo4j completada.")
+        except Neo4jError as exc:
+            LOGGER.warning("⚠️ Error indexando en Neo4j: %s", exc)
 
-    def close(self):
+    def close(self) -> None:
+        """Cierra conexiones abiertas de recursos externos."""
         if self.neo4j_driver:
             self.neo4j_driver.close()
 
     def _estimate_tokens(self, text: str) -> int:
+        """Estima tokens de forma conservadora según longitud."""
         if not text:
             return 0
         # Estimación conservadora (aprox. 1 token cada 4 caracteres)
         return max(1, len(text) // 4)
 
-    def _split_char_overlap_with_params(self, text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    def _split_char_overlap_with_params(
+            self,
+            text: str,
+            chunk_size: int,
+            chunk_overlap: int) -> list[str]:
+        """Fragmenta texto por tamaño fijo con solapamiento configurable."""
         if not text:
             return []
         chunks = []
@@ -228,6 +291,7 @@ class KDBIngestor:
         return chunks
 
     def _enforce_embedding_token_limit(self, text: str) -> list[str]:
+        """Garantiza que un fragmento no supere el límite estimado."""
         if not text:
             return []
         if self._estimate_tokens(text) <= self.max_embedding_tokens:
@@ -235,9 +299,17 @@ class KDBIngestor:
 
         max_chars = self.max_embedding_tokens * 4
         safe_overlap = min(self.chunk_overlap, max_chars // 5)
-        return self._split_char_overlap_with_params(text, max_chars, safe_overlap)
+        return self._split_char_overlap_with_params(
+            text, max_chars, safe_overlap)
 
-    def _upsert_in_batches(self, collection, texts, metadatas, ids):
+    def _upsert_in_batches(
+        self,
+        collection: Any,
+        texts: list[str],
+        metadatas: list[dict[str, Any]],
+        ids: list[str],
+    ) -> None:
+        """Realiza upsert en lotes para evitar límites de token/tamaño."""
         batch_texts = []
         batch_metadatas = []
         batch_ids = []
@@ -245,8 +317,10 @@ class KDBIngestor:
         total = len(texts)
         inserted = 0
 
-        def flush_batch():
-            nonlocal batch_texts, batch_metadatas, batch_ids, batch_tokens, inserted
+        def flush_batch() -> None:
+            """Envía el lote acumulado al vector store y reinicia buffers."""
+            nonlocal batch_texts, batch_metadatas, batch_ids
+            nonlocal batch_tokens, inserted
             if not batch_texts:
                 return
             collection.upsert(
@@ -255,7 +329,7 @@ class KDBIngestor:
                 ids=batch_ids
             )
             inserted += len(batch_texts)
-            print(f"   ↳ Upsert batch OK: {inserted}/{total} chunks")
+            LOGGER.info("   ↳ Upsert batch OK: %s/%s chunks", inserted, total)
             batch_texts = []
             batch_metadatas = []
             batch_ids = []
@@ -265,10 +339,15 @@ class KDBIngestor:
             item_tokens = self._estimate_tokens(text)
 
             if item_tokens > self.max_batch_tokens:
-                print(f"⚠️ Chunk muy grande ({item_tokens} tokens est.). Se omite id={doc_id}")
+                LOGGER.warning(
+                    "⚠️ Chunk muy grande (%s tokens est.). Se omite id=%s",
+                    item_tokens,
+                    doc_id,
+                )
                 continue
 
-            would_exceed_tokens = (batch_tokens + item_tokens) > self.max_batch_tokens
+            would_exceed_tokens = (
+                batch_tokens + item_tokens) > self.max_batch_tokens
             would_exceed_items = len(batch_texts) >= self.max_batch_items
 
             if would_exceed_tokens or would_exceed_items:
@@ -281,7 +360,8 @@ class KDBIngestor:
 
         flush_batch()
 
-    def _get_chunking_state(self) -> dict:
+    def _get_chunking_state(self) -> dict[str, int | str]:
+        """Devuelve snapshot de la configuración actual de chunking."""
         return {
             "chunk_strategy": self.chunk_strategy,
             "chunk_size": self.chunk_size,
@@ -294,27 +374,41 @@ class KDBIngestor:
             "code_line_overlap": self.code_line_overlap,
         }
 
-    def _restore_chunking_state(self, state: dict):
+    def _restore_chunking_state(self, state: dict[str, Any]) -> None:
+        """Restaura configuración de chunking desde un snapshot previo."""
         self.chunk_strategy = state.get("chunk_strategy", self.chunk_strategy)
         self.chunk_size = state.get("chunk_size", self.chunk_size)
         self.chunk_overlap = state.get("chunk_overlap", self.chunk_overlap)
-        self.sentence_window_size = state.get("sentence_window_size", self.sentence_window_size)
-        self.sentence_overlap = state.get("sentence_overlap", self.sentence_overlap)
-        self.paragraph_window_size = state.get("paragraph_window_size", self.paragraph_window_size)
-        self.paragraph_overlap = state.get("paragraph_overlap", self.paragraph_overlap)
-        self.code_line_window = state.get("code_line_window", self.code_line_window)
-        self.code_line_overlap = state.get("code_line_overlap", self.code_line_overlap)
+        self.sentence_window_size = state.get(
+            "sentence_window_size", self.sentence_window_size)
+        self.sentence_overlap = state.get(
+            "sentence_overlap", self.sentence_overlap)
+        self.paragraph_window_size = state.get(
+            "paragraph_window_size", self.paragraph_window_size)
+        self.paragraph_overlap = state.get(
+            "paragraph_overlap", self.paragraph_overlap)
+        self.code_line_window = state.get(
+            "code_line_window", self.code_line_window)
+        self.code_line_overlap = state.get(
+            "code_line_overlap", self.code_line_overlap)
 
-    def _apply_profile_settings(self, profile: dict):
+    def _apply_profile_settings(self, profile: dict[str, Any]) -> None:
+        """Aplica parámetros de un perfil de colección al estado actual."""
         self.chunk_strategy = profile.get("strategy", self.chunk_strategy)
         for key in [
-            "chunk_size", "chunk_overlap", "sentence_window_size", "sentence_overlap",
-            "paragraph_window_size", "paragraph_overlap", "code_line_window", "code_line_overlap"
-        ]:
+            "chunk_size",
+            "chunk_overlap",
+            "sentence_window_size",
+            "sentence_overlap",
+            "paragraph_window_size",
+            "paragraph_overlap",
+            "code_line_window",
+                "code_line_overlap"]:
             if key in profile:
                 setattr(self, key, profile[key])
 
-    def _build_vector_id(self, metadata: dict, text: str) -> str:
+    def _build_vector_id(self, metadata: dict[str, Any], text: str) -> str:
+        """Construye ID determinístico por fuente, estrategia y posición."""
         source = metadata.get("source", "desconocido")
         strategy = metadata.get("chunk_strategy", "unknown")
         position = metadata.get("position", 0)
@@ -322,52 +416,66 @@ class KDBIngestor:
         return uuid.uuid5(uuid.NAMESPACE_URL, fingerprint).hex
 
     def _split_char_overlap(self, text: str) -> list[str]:
-        return self._split_char_overlap_with_params(text, self.chunk_size, self.chunk_overlap)
+        """Fragmenta con la configuración global de tamaño y overlap."""
+        return self._split_char_overlap_with_params(
+            text, self.chunk_size, self.chunk_overlap)
 
     def _split_sentence_window(self, text: str) -> list[str]:
+        """Agrupa oraciones en ventanas con solapamiento entre ventanas."""
         if not text:
             return []
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        sentences = [s.strip() for s in re.split(
+            r"(?<=[.!?])\s+", text) if s.strip()]
         if not sentences:
             return self._split_char_overlap(text)
         chunks = []
         i = 0
         step = max(1, self.sentence_window_size - self.sentence_overlap)
         while i < len(sentences):
-            chunk = " ".join(sentences[i:i + self.sentence_window_size]).strip()
+            chunk = " ".join(
+                sentences[i:i + self.sentence_window_size]).strip()
             if chunk:
                 chunks.append(chunk)
             i += step
         return chunks
 
     def _split_paragraph_window(self, text: str) -> list[str]:
+        """Agrupa párrafos en ventanas con solapamiento entre grupos."""
         if not text:
             return []
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+        paragraphs = [p.strip()
+                      for p in re.split(r"\n\s*\n+", text) if p.strip()]
         if not paragraphs:
             return self._split_char_overlap(text)
         chunks = []
         i = 0
         step = max(1, self.paragraph_window_size - self.paragraph_overlap)
         while i < len(paragraphs):
-            chunk = "\n\n".join(paragraphs[i:i + self.paragraph_window_size]).strip()
+            chunk = "\n\n".join(
+                paragraphs[i:i + self.paragraph_window_size]).strip()
             if chunk:
                 chunks.append(chunk)
             i += step
         return chunks
 
     def _split_heading_window(self, text: str) -> list[str]:
+        """Segmenta por encabezados y ajusta tamaño máximo por fragmento."""
         if not text:
             return []
-        heading_pattern = r"(?m)(?=^\s{0,3}#{1,6}\s+|^\s*\d+[\.)]\s+|^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{8,}$)"
-        sections = [s.strip() for s in re.split(heading_pattern, text) if s.strip()]
+        heading_pattern = (
+            r"(?m)(?=^\s{0,3}#{1,6}\s+|^\s*\d+[\.)]\s+|"
+            r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{8,}$)"
+        )
+        sections = [s.strip() for s in re.split(
+            heading_pattern, text) if s.strip()]
         if len(sections) <= 1:
             return self._split_paragraph_window(text)
 
         chunks = []
         current = ""
         for section in sections:
-            candidate = (current + "\n\n" + section).strip() if current else section
+            candidate = (current + "\n\n" +
+                         section).strip() if current else section
             if len(candidate) <= self.chunk_size:
                 current = candidate
             else:
@@ -383,6 +491,7 @@ class KDBIngestor:
         return chunks
 
     def _split_code_aware(self, text: str) -> list[str]:
+        """Segmenta código respetando fronteras sintácticas y tamaño máximo."""
         if not text:
             return []
         lines = text.splitlines()
@@ -390,11 +499,11 @@ class KDBIngestor:
             return []
 
         code_boundary_pattern = re.compile(
-            r"^\s*(def\s+|class\s+|async\s+def\s+|function\s+|async\s+function\s+|"
-            r"public\s+|private\s+|protected\s+|interface\s+|enum\s+|struct\s+|"
+            r"^\s*(def\s+|class\s+|async\s+def\s+|function\s+|"
+            r"async\s+function\s+|public\s+|private\s+|protected\s+|"
+            r"interface\s+|enum\s+|struct\s+|"
             r"impl\s+|fn\s+|export\s+class\s+|export\s+function\s+|"
-            r"if\s+__name__\s*==\s*['\"]__main__['\"])"
-        )
+            r"if\s+__name__\s*==\s*['\"]__main__['\"])")
 
         boundaries = [0]
         for idx, line in enumerate(lines[1:], start=1):
@@ -423,7 +532,8 @@ class KDBIngestor:
             line_start = 0
             line_step = max(1, self.code_line_window - self.code_line_overlap)
             while line_start < len(block_lines):
-                line_end = min(len(block_lines), line_start + self.code_line_window)
+                line_end = min(len(block_lines), line_start +
+                               self.code_line_window)
                 piece = "\n".join(block_lines[line_start:line_end]).strip()
                 if piece:
                     if len(piece) <= self.chunk_size:
@@ -434,6 +544,7 @@ class KDBIngestor:
         return chunks
 
     def _split_text(self, text: str) -> list[str]:
+        """Despacha el texto al algoritmo de chunking configurado."""
         strategy = self.chunk_strategy
         if strategy == "sentence_window":
             return self._split_sentence_window(text)
@@ -445,9 +556,14 @@ class KDBIngestor:
             return self._split_code_aware(text)
         return self._split_char_overlap(text)
 
-    def _chunk_documents(self, raw_docs: list[dict], collection_name: str = "kdb_principal") -> list[dict]:
-        docs = []
-        source_positions = {}
+    def _chunk_documents(
+        self,
+        raw_docs: list[dict[str, Any]],
+        collection_name: str = "kdb_principal",
+    ) -> list[dict[str, Any]]:
+        """Convierte documentos crudos en chunks listos para indexación."""
+        docs: list[dict[str, Any]] = []
+        source_positions: dict[str, int] = {}
         for raw_idx, d in enumerate(raw_docs):
             text = d.get("page_content", "") or ""
             text = text.strip()
@@ -474,20 +590,21 @@ class KDBIngestor:
                         "collection": collection_name,
                         "parent_id": parent_id
                     }
-                    docs.append({"page_content": safe_chunk, "metadata": metadata})
+                    docs.append(
+                        {"page_content": safe_chunk, "metadata": metadata})
                     source_positions[source] += 1
         return docs
 
-    def load_documents(self):
-        """Carga y procesa documentos de diferentes formatos."""
-        documents = []
+    def load_documents(self) -> list[dict[str, Any]]:
+        """Carga y normaliza documentos fuente en formato interno."""
+        documents: list[dict[str, Any]] = []
         for root, _, files in os.walk(self.data_path):
             for file_name in files:
                 file_path = os.path.join(root, file_name)
                 rel_path = os.path.relpath(file_path, self.data_path)
                 ext = os.path.splitext(file_name)[1].lower()
 
-                print(f"📄 Procesando: {rel_path}")
+                LOGGER.info("📄 Procesando: %s", rel_path)
                 try:
                     if ext == '.pdf':
                         reader = PdfReader(file_path)
@@ -495,49 +612,82 @@ class KDBIngestor:
                             text = page.extract_text() or ""
                             documents.append({
                                 "page_content": text,
-                                "metadata": {"source": rel_path, "file_type": "pdf"}
+                                "metadata": {
+                                    "source": rel_path,
+                                    "file_type": "pdf",
+                                },
                             })
                     elif ext in ('.xlsx', '.xls'):
                         wb = openpyxl.load_workbook(file_path, data_only=True)
                         for sheet in wb.worksheets:
                             for row in sheet.iter_rows(values_only=True):
-                                text = " ".join([str(cell) for cell in row if cell is not None])
+                                text = " ".join(
+                                    [
+                                        str(cell)
+                                        for cell in row
+                                        if cell is not None
+                                    ]
+                                )
                                 if text:
                                     documents.append({
                                         "page_content": text,
-                                        "metadata": {"source": rel_path, "file_type": "excel"}
+                                        "metadata": {
+                                            "source": rel_path,
+                                            "file_type": "excel",
+                                        },
                                     })
-                    elif ext in self.text_extensions or ext in self.code_extensions:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    elif (
+                        ext in self.text_extensions
+                        or ext in self.code_extensions
+                    ):
+                        with open(
+                            file_path,
+                            "r",
+                            encoding="utf-8",
+                            errors="ignore",
+                        ) as f:
                             text = f.read()
                         if text.strip():
                             documents.append({
                                 "page_content": text,
                                 "metadata": {
                                     "source": rel_path,
-                                    "file_type": "code" if ext in self.code_extensions else "text"
+                                    "file_type": (
+                                        "code"
+                                        if ext in self.code_extensions
+                                        else "text"
+                                    ),
                                 }
                             })
                     else:
-                        print(f"⚠️ Formato no soportado: {rel_path}")
-                except Exception as e:
-                    print(f"❌ Error cargando {rel_path}: {e}")
+                        LOGGER.warning("⚠️ Formato no soportado: %s", rel_path)
+                except (
+                    OSError,
+                    ValueError,
+                    PdfReadError,
+                    InvalidFileException,
+                ) as exc:
+                    LOGGER.warning("❌ Error cargando %s: %s", rel_path, exc)
         return documents
 
-    def run(self, github_url=None):
-        """Proceso principal de ingesta, particionado e indexación."""
+    def run(self, github_url: str | None = None) -> None:
+        """Ejecuta la ingesta completa hacia ChromaDB y Neo4j."""
         # 0. Si hay GitHub, descargar primero
         if github_url:
             loader = GitHubLoader(self.data_path)
-            loader.fetch_repo(github_url)
+            try:
+                loader.fetch_repo(github_url)
+            except RuntimeError as exc:
+                LOGGER.error("No se pudo cargar repositorio GitHub: %s", exc)
+                return
         # 1. Cargar documentos
         raw_docs = self.load_documents()
         if not raw_docs:
-            print("⚠️ No se encontraron documentos para procesar.")
+            LOGGER.warning("⚠️ No se encontraron documentos para procesar.")
             return
 
         # 2 y 3. Chunking + upsert en una o varias colecciones
-        print("✂️ Dividiendo documentos en fragmentos...")
+        LOGGER.info("✂️ Dividiendo documentos en fragmentos...")
         graph_docs = []
 
         if self.enable_multi_collection:
@@ -554,35 +704,43 @@ class KDBIngestor:
             saved_state = self._get_chunking_state()
             self._apply_profile_settings(profile)
 
-            print(f"🧠 Estrategia activa [{profile_name}]: {self.chunk_strategy}")
-            docs = self._chunk_documents(raw_docs, collection_name=profile_name)
-            print(f"💾 Guardando {len(docs)} fragmentos en ChromaDB ({profile_name})...")
+            LOGGER.info(
+                "🧠 Estrategia activa [%s]: %s",
+                profile_name,
+                self.chunk_strategy,
+            )
+            docs = self._chunk_documents(
+                raw_docs, collection_name=profile_name)
+            LOGGER.info(
+                "💾 Guardando %s fragmentos en ChromaDB (%s)...",
+                len(docs),
+                profile_name,
+            )
 
-            try:
-                collection = self.client.get_collection(
-                    profile_name,
-                    embedding_function=self.embedding_fn
-                )
-            except Exception:
-                collection = self.client.create_collection(
-                    name=profile_name,
-                    embedding_function=self.embedding_fn
-                )
+            collection = self.client.get_or_create_collection(
+                name=profile_name,
+                embedding_function=self.embedding_fn,
+            )
 
             texts = [d.get("page_content", "") for d in docs]
             metadatas = [
                 {
                     "source": d.get("metadata", {}).get("source", ""),
                     "file_type": d.get("metadata", {}).get("file_type", ""),
-                    "chunk_strategy": d.get("metadata", {}).get("chunk_strategy", ""),
-                    "collection": d.get("metadata", {}).get("collection", profile_name),
+                    "chunk_strategy": d.get("metadata", {}).get(
+                        "chunk_strategy", ""
+                    ),
+                    "collection": d.get("metadata", {}).get(
+                        "collection", profile_name
+                    ),
                     "parent_id": d.get("metadata", {}).get("parent_id", ""),
-                    "position": d.get("metadata", {}).get("position", 0)
+                    "position": d.get("metadata", {}).get("position", 0),
                 }
                 for d in docs
             ]
             ids = [
-                self._build_vector_id(d.get("metadata", {}), d.get("page_content", ""))
+                self._build_vector_id(
+                    d.get("metadata", {}), d.get("page_content", ""))
                 for d in docs
             ]
             self._upsert_in_batches(collection, texts, metadatas, ids)
@@ -592,19 +750,21 @@ class KDBIngestor:
 
             self._restore_chunking_state(saved_state)
 
-        # 4. Indexar estructura documental en Neo4j (solo perfil principal para continuidad)
+        # 4. Indexar estructura documental en Neo4j (solo perfil principal para
+        # continuidad)
         self._index_graph(graph_docs)
-        
-        print("✅ Ingesta finalizada exitosamente.")
+
+        LOGGER.info("✅ Ingesta finalizada exitosamente.")
         self.close()
+
 
 if __name__ == "__main__":
     # Si ejecutas este archivo directamente, procesa la carpeta por defecto
     INGEST_DATA_PATH = "./documentos_fuente"
     INGEST_DB_PATH = "./db_chroma_kdb"
-    
+
     # Crear carpeta si no existe
     os.makedirs(INGEST_DATA_PATH, exist_ok=True)
-    
+
     ingestor = KDBIngestor(INGEST_DATA_PATH, INGEST_DB_PATH)
     ingestor.run()

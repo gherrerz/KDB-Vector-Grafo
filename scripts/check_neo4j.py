@@ -1,10 +1,19 @@
+"""Utility script to validate Neo4j connectivity from environment vars."""
+
 import os
 import sys
+import logging
+
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def main() -> int:
+    """Validate Neo4j connectivity and return a process exit code."""
     load_dotenv()
 
     uri = os.getenv("NEO4J_URI")
@@ -23,27 +32,31 @@ def main() -> int:
     ]
 
     if missing:
-        print(f"❌ Variables faltantes: {', '.join(missing)}")
+        LOGGER.error("❌ Variables faltantes: %s", ", ".join(missing))
         return 1
 
+    driver = None
     try:
         driver = GraphDatabase.driver(uri, auth=(user, password))
         with driver.session(database=database) as session:
             result = session.run("RETURN 1 AS ok")
             value = result.single()["ok"]
-        driver.close()
 
         if value == 1:
-            print("✅ Neo4j conectado correctamente")
-            print(f"- URI: {uri}")
-            print(f"- Database: {database}")
+            LOGGER.info("✅ Neo4j conectado correctamente")
+            LOGGER.info("- URI: %s", uri)
+            LOGGER.info("- Database: %s", database)
             return 0
-        print("❌ Neo4j respondió un valor inesperado")
+        LOGGER.error("❌ Neo4j respondió un valor inesperado")
         return 1
-    except Exception as exc:
-        print(f"❌ Error conectando Neo4j: {exc}")
+    except (AuthError, ServiceUnavailable, Neo4jError) as exc:
+        LOGGER.error("❌ Error conectando Neo4j: %s", exc)
         return 1
+    finally:
+        if driver is not None:
+            driver.close()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())
