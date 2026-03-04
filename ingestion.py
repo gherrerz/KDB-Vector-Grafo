@@ -4,7 +4,8 @@ import os
 import re
 import uuid
 import logging
-from typing import Any
+from typing import Any, Callable
+from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -35,6 +36,7 @@ class KDBIngestor:
         data_path: str,
         db_path: str,
         chroma_client: Any | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """
         Inicializa el ingestor de la base de conocimientos.
@@ -45,6 +47,7 @@ class KDBIngestor:
         """
         self.data_path = data_path
         self.db_path = db_path
+        self.progress_callback = progress_callback
         # Usar cliente existente si se proporciona, sino crear uno nuevo
         if chroma_client is not None:
             self.client = chroma_client
@@ -88,11 +91,11 @@ class KDBIngestor:
 
         # Configuración de chunking (elige UNA estrategia descomentando una
         # línea)
-        self.chunk_strategy = "char_overlap"
+        # self.chunk_strategy = "char_overlap"
         # self.chunk_strategy = "sentence_window"
         # self.chunk_strategy = "paragraph_window"
         # self.chunk_strategy = "heading_window"
-        # self.chunk_strategy = "code_aware"
+        self.chunk_strategy = "code_aware"
 
         # Parámetros generales de chunking
         self.chunk_size = 1000
@@ -107,6 +110,8 @@ class KDBIngestor:
         self.max_batch_tokens = 7000
         self.max_batch_items = 100
         self.max_embedding_tokens = 8000
+        self.max_batch_chars = 18000
+        self.max_embedding_chars = 12000
 
         self.text_extensions = {
             ".txt",
@@ -117,7 +122,20 @@ class KDBIngestor:
             ".csv",
             ".json",
             ".yaml",
-            ".yml"}
+            ".yml",
+            ".xml",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".properties",
+            ".gradle",
+            ".kts",
+            ".html",
+            ".css",
+            ".scss",
+            ".less",
+        }
         self.code_extensions = {
             ".py",
             ".js",
@@ -140,13 +158,44 @@ class KDBIngestor:
             ".sql",
             ".sh",
             ".ps1",
-            ".bat"}
+            ".bat",
+            ".vue",
+            ".svelte",
+            ".dart",
+            ".r",
+            ".m",
+            ".mm",
+        }
+        self.special_text_filenames = {
+            "dockerfile",
+            "makefile",
+            "pom.xml",
+            "build.gradle",
+            "settings.gradle",
+            "gradle.properties",
+            "gradlew",
+            "gradlew.bat",
+        }
 
         self.neo4j_uri = os.getenv("NEO4J_URI", "")
         self.neo4j_user = os.getenv("NEO4J_USER", "")
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", "")
         self.neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
         self.neo4j_driver = self._init_neo4j_driver()
+
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        """Emite eventos de progreso hacia la UI si hay callback."""
+        if not self.progress_callback:
+            return
+        try:
+            data = {"event": event, **payload}
+            self.progress_callback(data)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            LOGGER.debug("No se pudo emitir progreso (%s): %s", event, exc)
+
+    def _is_bad_request_error(self, exc: Exception) -> bool:
+        """Detecta BadRequestError sin depender del import directo."""
+        return exc.__class__.__name__ == "BadRequestError"
 
     def _init_neo4j_driver(self) -> Driver | None:
         """Inicializa y valida la conexión de Neo4j."""
@@ -294,10 +343,18 @@ class KDBIngestor:
         """Garantiza que un fragmento no supere el límite estimado."""
         if not text:
             return []
-        if self._estimate_tokens(text) <= self.max_embedding_tokens:
+        max_embedding_chars = getattr(
+            self,
+            "max_embedding_chars",
+            self.max_embedding_tokens * 4,
+        )
+        if (
+            self._estimate_tokens(text) <= self.max_embedding_tokens
+            and len(text) <= max_embedding_chars
+        ):
             return [text]
 
-        max_chars = self.max_embedding_tokens * 4
+        max_chars = min(self.max_embedding_tokens * 4, max_embedding_chars)
         safe_overlap = min(self.chunk_overlap, max_chars // 5)
         return self._split_char_overlap_with_params(
             text, max_chars, safe_overlap)
@@ -314,51 +371,207 @@ class KDBIngestor:
         batch_metadatas = []
         batch_ids = []
         batch_tokens = 0
+        batch_chars = 0
         total = len(texts)
         inserted = 0
+        failed = 0
+
+        self._emit_progress(
+            "upsert_start",
+            total_chunks=total,
+            max_batch_tokens=self.max_batch_tokens,
+            max_batch_chars=self.max_batch_chars,
+            max_embedding_tokens=self.max_embedding_tokens,
+            max_embedding_chars=self.max_embedding_chars,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+        def upsert_with_retry(
+            docs: list[str],
+            metas: list[dict[str, Any]],
+            doc_ids: list[str],
+            depth: int = 0,
+        ) -> tuple[int, int]:
+            """Inserta lote y reintenta dividiendo cuando hay BadRequestError."""
+            if not docs:
+                return 0, 0
+            try:
+                collection.upsert(documents=docs, metadatas=metas, ids=doc_ids)
+                return len(docs), 0
+            except Exception as exc:  # pragma: no cover - depende de API externa
+                if self._is_bad_request_error(exc) and len(docs) > 1 and depth < 6:
+                    mid = len(docs) // 2
+                    self._emit_progress(
+                        "upsert_split_batch",
+                        batch_size=len(docs),
+                        depth=depth,
+                        reason="BadRequestError",
+                    )
+                    ok_left, fail_left = upsert_with_retry(
+                        docs[:mid],
+                        metas[:mid],
+                        doc_ids[:mid],
+                        depth + 1,
+                    )
+                    ok_right, fail_right = upsert_with_retry(
+                        docs[mid:],
+                        metas[mid:],
+                        doc_ids[mid:],
+                        depth + 1,
+                    )
+                    return ok_left + ok_right, fail_left + fail_right
+
+                if self._is_bad_request_error(exc):
+                    self._emit_progress(
+                        "upsert_bad_request",
+                        batch_size=len(docs),
+                        depth=depth,
+                        error=str(exc),
+                        sample_id=doc_ids[0] if doc_ids else "",
+                    )
+                else:
+                    self._emit_progress(
+                        "upsert_error",
+                        batch_size=len(docs),
+                        depth=depth,
+                        error=str(exc),
+                    )
+                LOGGER.warning("⚠️ Error en upsert de lote: %s", exc)
+                return 0, len(docs)
 
         def flush_batch() -> None:
             """Envía el lote acumulado al vector store y reinicia buffers."""
             nonlocal batch_texts, batch_metadatas, batch_ids
-            nonlocal batch_tokens, inserted
+            nonlocal batch_tokens, batch_chars, inserted, failed
             if not batch_texts:
                 return
-            collection.upsert(
-                documents=batch_texts,
-                metadatas=batch_metadatas,
-                ids=batch_ids
+            current_batch_size = len(batch_texts)
+            current_batch_tokens = batch_tokens
+            current_batch_chars = batch_chars
+            ok_count, fail_count = upsert_with_retry(
+                batch_texts,
+                batch_metadatas,
+                batch_ids,
             )
-            inserted += len(batch_texts)
-            LOGGER.info("   ↳ Upsert batch OK: %s/%s chunks", inserted, total)
+            inserted += ok_count
+            failed += fail_count
+            LOGGER.info(
+                "   ↳ Upsert batch procesado: %s OK, %s fallo "
+                "(acumulado %s/%s)",
+                ok_count,
+                fail_count,
+                inserted,
+                total,
+            )
+            self._emit_progress(
+                "upsert_batch_result",
+                batch_size=current_batch_size,
+                batch_tokens=current_batch_tokens,
+                batch_chars=current_batch_chars,
+                inserted=inserted,
+                failed=failed,
+                total_chunks=total,
+                progress=(inserted + failed) / max(1, total),
+            )
             batch_texts = []
             batch_metadatas = []
             batch_ids = []
             batch_tokens = 0
+            batch_chars = 0
 
-        for text, metadata, doc_id in zip(texts, metadatas, ids):
+        def append_item(
+            text: str,
+            metadata: dict[str, Any],
+            doc_id: str,
+        ) -> None:
+            """Agrega un ítem al lote; si excede tamaño lo divide."""
+            nonlocal batch_tokens
+            nonlocal batch_chars
             item_tokens = self._estimate_tokens(text)
+            item_chars = len(text)
+            max_embedding_chars = getattr(
+                self,
+                "max_embedding_chars",
+                self.max_embedding_tokens * 4,
+            )
 
-            if item_tokens > self.max_batch_tokens:
-                LOGGER.warning(
-                    "⚠️ Chunk muy grande (%s tokens est.). Se omite id=%s",
-                    item_tokens,
+            if item_chars > max_embedding_chars:
+                safe_overlap = min(self.chunk_overlap, max_embedding_chars // 5)
+                pieces = self._split_char_overlap_with_params(
+                    text,
+                    max_embedding_chars,
+                    safe_overlap,
+                )
+                LOGGER.info(
+                    "↳ Chunk largo dividido por caracteres en %s partes. "
+                    "id=%s",
+                    len(pieces),
                     doc_id,
                 )
-                continue
+                self._emit_progress(
+                    "chunk_split_chars",
+                    original_chars=item_chars,
+                    parts=len(pieces),
+                    source=metadata.get("source", ""),
+                    doc_id=doc_id,
+                )
+                for idx, piece in enumerate(pieces):
+                    piece_id = f"{doc_id}::char_part::{idx}"
+                    append_item(piece, metadata, piece_id)
+                return
+
+            if item_tokens > self.max_batch_tokens:
+                max_chars = min(self.max_batch_tokens * 3, max_embedding_chars)
+                safe_overlap = min(self.chunk_overlap, max_chars // 5)
+                pieces = self._split_char_overlap_with_params(
+                    text,
+                    max_chars,
+                    safe_overlap,
+                )
+                LOGGER.info(
+                    "↳ Chunk grande dividido en %s partes. id=%s",
+                    len(pieces),
+                    doc_id,
+                )
+                self._emit_progress(
+                    "chunk_split_tokens",
+                    original_tokens=item_tokens,
+                    parts=len(pieces),
+                    source=metadata.get("source", ""),
+                    doc_id=doc_id,
+                )
+                for idx, piece in enumerate(pieces):
+                    piece_id = f"{doc_id}::part::{idx}"
+                    append_item(piece, metadata, piece_id)
+                return
 
             would_exceed_tokens = (
                 batch_tokens + item_tokens) > self.max_batch_tokens
             would_exceed_items = len(batch_texts) >= self.max_batch_items
+            max_batch_chars = getattr(self, "max_batch_chars", 18000)
+            would_exceed_chars = (
+                batch_chars + item_chars) > max_batch_chars
 
-            if would_exceed_tokens or would_exceed_items:
+            if would_exceed_tokens or would_exceed_items or would_exceed_chars:
                 flush_batch()
 
             batch_texts.append(text)
             batch_metadatas.append(metadata)
             batch_ids.append(doc_id)
             batch_tokens += item_tokens
+            batch_chars += item_chars
+
+        for text, metadata, doc_id in zip(texts, metadatas, ids):
+            append_item(text, metadata, doc_id)
 
         flush_batch()
+        self._emit_progress(
+            "upsert_end",
+            inserted=inserted,
+            failed=failed,
+            total_chunks=total,
+        )
 
     def _get_chunking_state(self) -> dict[str, int | str]:
         """Devuelve snapshot de la configuración actual de chunking."""
@@ -595,83 +808,403 @@ class KDBIngestor:
                     source_positions[source] += 1
         return docs
 
+    def _is_supported_source_file(self, file_name: str) -> bool:
+        """Determina si el archivo es soportado por extensión o nombre."""
+        ext = os.path.splitext(file_name)[1].lower()
+        normalized_name = file_name.lower()
+        return (
+            ext in self.text_extensions
+            or ext in self.code_extensions
+            or normalized_name in self.special_text_filenames
+        )
+
+    def _detect_file_type(self, file_name: str) -> str:
+        """Clasifica archivo como code/text para metadatos."""
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext in self.code_extensions:
+            return "code"
+        return "text"
+
+    def _extract_code_entities(
+        self,
+        raw_docs: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """Extrae entidades de código y relaciones de dependencia básicas."""
+        code_docs = [
+            d for d in raw_docs if d.get("metadata", {}).get("file_type") == "code"
+        ]
+        if not code_docs:
+            return [], []
+
+        entity_rows: list[dict[str, Any]] = []
+        dependency_rows: list[dict[str, str]] = []
+        entities_by_file: dict[str, list[dict[str, Any]]] = {}
+
+        class_like_pattern = re.compile(
+            r"\b(class|interface|enum|struct)\s+([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        python_def_pattern = re.compile(
+            r"(?m)^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
+        )
+        import_pattern = re.compile(
+            r"(?m)^\s*(?:from\s+([\w\.]+)\s+import\s+([^\n#]+)|"
+            r"import\s+([^\n#;]+)|"
+            r"import\s+[^;\n]+\s+from\s+['\"]([^'\"]+)['\"]|"
+            r"#include\s+[\"<]([^\">]+)[\">])"
+        )
+        extends_pattern = re.compile(
+            r"\b(?:extends|implements)\s+([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        python_inherit_pattern = re.compile(
+            r"(?m)^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\(([^\)]*)\)\s*:"
+        )
+
+        for doc in code_docs:
+            metadata = doc.get("metadata", {})
+            source = metadata.get("source", "desconocido")
+            text = doc.get("page_content", "") or ""
+
+            found_entities: list[dict[str, Any]] = []
+            for kind, name in class_like_pattern.findall(text):
+                entity_id = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{source}|{kind}|{name}",
+                ).hex
+                found_entities.append(
+                    {
+                        "id": entity_id,
+                        "name": name,
+                        "kind": kind.lower(),
+                        "source": source,
+                    }
+                )
+
+            if source.lower().endswith(".py"):
+                for fn_name in python_def_pattern.findall(text):
+                    fn_id = uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{source}|function|{fn_name}",
+                    ).hex
+                    found_entities.append(
+                        {
+                            "id": fn_id,
+                            "name": fn_name,
+                            "kind": "function",
+                            "source": source,
+                        }
+                    )
+
+            if not found_entities:
+                module_name = Path(source).stem or self._normalize_id(source)
+                module_id = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{source}|module|{module_name}",
+                ).hex
+                found_entities.append(
+                    {
+                        "id": module_id,
+                        "name": module_name,
+                        "kind": "module",
+                        "source": source,
+                    }
+                )
+
+            entities_by_file[source] = found_entities
+            entity_rows.extend(found_entities)
+
+        entities_by_name: dict[str, list[dict[str, Any]]] = {}
+        for entity in entity_rows:
+            entities_by_name.setdefault(entity["name"], []).append(entity)
+
+        for doc in code_docs:
+            metadata = doc.get("metadata", {})
+            source = metadata.get("source", "desconocido")
+            text = doc.get("page_content", "") or ""
+            owner_entities = entities_by_file.get(source, [])
+            owner_ids = [item["id"] for item in owner_entities]
+
+            dependency_names: set[str] = set()
+            for match in import_pattern.findall(text):
+                from_mod, from_items, plain_import, es_import, c_include = match
+                if from_items:
+                    for item in from_items.split(","):
+                        cleaned = item.strip().split(" as ")[0].strip()
+                        if cleaned and cleaned != "*":
+                            dependency_names.add(cleaned.split(".")[-1])
+                if plain_import:
+                    for item in plain_import.split(","):
+                        cleaned = item.strip().split(" as ")[0].strip()
+                        if cleaned:
+                            dependency_names.add(cleaned.split(".")[-1])
+                if from_mod:
+                    dependency_names.add(from_mod.split(".")[-1])
+                if es_import:
+                    dependency_names.add(es_import.split("/")[-1])
+                if c_include:
+                    include_name = Path(c_include).stem
+                    if include_name:
+                        dependency_names.add(include_name)
+
+            for parent in extends_pattern.findall(text):
+                dependency_names.add(parent)
+
+            for inherits in python_inherit_pattern.findall(text):
+                for parent in inherits.split(","):
+                    parent_name = parent.strip().split(".")[-1]
+                    if parent_name:
+                        dependency_names.add(parent_name)
+
+            for dependency_name in dependency_names:
+                targets = entities_by_name.get(dependency_name, [])
+                for owner_id in owner_ids:
+                    for target in targets:
+                        if owner_id == target["id"]:
+                            continue
+                        dependency_rows.append(
+                            {
+                                "from_id": owner_id,
+                                "to_id": target["id"],
+                                "type": "DEPENDS_ON",
+                            }
+                        )
+
+        unique_entities = {
+            row["id"]: row for row in entity_rows
+        }
+        unique_dependencies = {
+            (row["from_id"], row["to_id"], row["type"]): row
+            for row in dependency_rows
+        }
+
+        return list(unique_entities.values()), list(unique_dependencies.values())
+
+    def _index_code_graph(self, raw_docs: list[dict[str, Any]]) -> None:
+        """Indexa entidades de código y dependencias para análisis de impacto."""
+        if not self.neo4j_driver:
+            return
+
+        entities, dependencies = self._extract_code_entities(raw_docs)
+        if not entities:
+            LOGGER.info("ℹ️ No se detectaron entidades de código para Neo4j.")
+            return
+
+        file_rows = sorted(
+            {
+                row["source"]
+                for row in entities
+                if row.get("source")
+            }
+        )
+
+        try:
+            with self.neo4j_driver.session(
+                database=self.neo4j_database,
+            ) as session:
+                session.run(
+                    "CREATE CONSTRAINT code_file_path_unique "
+                    "IF NOT EXISTS "
+                    "FOR (f:CodeFile) REQUIRE f.path IS UNIQUE"
+                )
+                session.run(
+                    "CREATE CONSTRAINT code_entity_id_unique "
+                    "IF NOT EXISTS "
+                    "FOR (e:CodeEntity) REQUIRE e.id IS UNIQUE"
+                )
+
+                session.run(
+                    """
+                    UNWIND $files AS file_path
+                    MERGE (f:CodeFile {path: file_path})
+                    """,
+                    files=file_rows,
+                )
+
+                session.run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (e:CodeEntity {id: row.id})
+                    SET e.name = row.name,
+                        e.kind = row.kind,
+                        e.source = row.source
+                    WITH e, row
+                    MATCH (f:CodeFile {path: row.source})
+                    MERGE (f)-[:DECLARES]->(e)
+                    """,
+                    rows=entities,
+                )
+
+                if dependencies:
+                    session.run(
+                        """
+                        UNWIND $rels AS rel
+                        MATCH (src:CodeEntity {id: rel.from_id})
+                        MATCH (dst:CodeEntity {id: rel.to_id})
+                        MERGE (src)-[r:DEPENDS_ON]->(dst)
+                        SET r.type = rel.type
+                        """,
+                        rels=dependencies,
+                    )
+
+            LOGGER.info(
+                "✅ Grafo de código actualizado en Neo4j: %s entidades, "
+                "%s dependencias.",
+                len(entities),
+                len(dependencies),
+            )
+        except Neo4jError as exc:
+            LOGGER.warning(
+                "⚠️ Error indexando grafo de código en Neo4j: %s",
+                exc,
+            )
+
     def load_documents(self) -> list[dict[str, Any]]:
         """Carga y normaliza documentos fuente en formato interno."""
         documents: list[dict[str, Any]] = []
+        file_entries: list[tuple[str, str, str]] = []
+
         for root, _, files in os.walk(self.data_path):
             for file_name in files:
                 file_path = os.path.join(root, file_name)
                 rel_path = os.path.relpath(file_path, self.data_path)
                 ext = os.path.splitext(file_name)[1].lower()
+                file_entries.append((file_path, rel_path, ext))
 
-                LOGGER.info("📄 Procesando: %s", rel_path)
-                try:
-                    if ext == '.pdf':
-                        reader = PdfReader(file_path)
-                        for page in reader.pages:
-                            text = page.extract_text() or ""
-                            documents.append({
-                                "page_content": text,
-                                "metadata": {
-                                    "source": rel_path,
-                                    "file_type": "pdf",
-                                },
-                            })
-                    elif ext in ('.xlsx', '.xls'):
-                        wb = openpyxl.load_workbook(file_path, data_only=True)
-                        for sheet in wb.worksheets:
-                            for row in sheet.iter_rows(values_only=True):
-                                text = " ".join(
-                                    [
-                                        str(cell)
-                                        for cell in row
-                                        if cell is not None
-                                    ]
-                                )
-                                if text:
-                                    documents.append({
-                                        "page_content": text,
-                                        "metadata": {
-                                            "source": rel_path,
-                                            "file_type": "excel",
-                                        },
-                                    })
-                    elif (
-                        ext in self.text_extensions
-                        or ext in self.code_extensions
-                    ):
-                        with open(
-                            file_path,
-                            "r",
-                            encoding="utf-8",
-                            errors="ignore",
-                        ) as f:
-                            text = f.read()
-                        if text.strip():
-                            documents.append({
-                                "page_content": text,
-                                "metadata": {
-                                    "source": rel_path,
-                                    "file_type": (
-                                        "code"
-                                        if ext in self.code_extensions
-                                        else "text"
-                                    ),
-                                }
-                            })
+        total_files = len(file_entries)
+        supported_files = sum(
+            1
+            for _, rel_path, _ in file_entries
+            if self._is_supported_source_file(os.path.basename(rel_path))
+            or os.path.splitext(rel_path)[1].lower() in (".pdf", ".xlsx", ".xls")
+        )
+
+        self._emit_progress(
+            "scan_complete",
+            total_files=total_files,
+            supported_files=supported_files,
+        )
+
+        if total_files == 0:
+            return documents
+
+        for index, (file_path, rel_path, ext) in enumerate(file_entries, start=1):
+            self._emit_progress(
+                "file_processing",
+                file=rel_path,
+                index=index,
+                total_files=total_files,
+                progress=index / total_files,
+            )
+            LOGGER.info("📄 Procesando: %s", rel_path)
+            try:
+                if ext == '.pdf':
+                    reader = PdfReader(file_path)
+                    before_count = len(documents)
+                    for page in reader.pages:
+                        text = page.extract_text() or ""
+                        documents.append({
+                            "page_content": text,
+                            "metadata": {
+                                "source": rel_path,
+                                "file_type": "pdf",
+                            },
+                        })
+                    loaded_rows = len(documents) - before_count
+                    self._emit_progress(
+                        "file_loaded",
+                        file=rel_path,
+                        file_type="pdf",
+                        records=loaded_rows,
+                    )
+                elif ext in ('.xlsx', '.xls'):
+                    wb = openpyxl.load_workbook(file_path, data_only=True)
+                    before_count = len(documents)
+                    for sheet in wb.worksheets:
+                        for row in sheet.iter_rows(values_only=True):
+                            text = " ".join(
+                                [
+                                    str(cell)
+                                    for cell in row
+                                    if cell is not None
+                                ]
+                            )
+                            if text:
+                                documents.append({
+                                    "page_content": text,
+                                    "metadata": {
+                                        "source": rel_path,
+                                        "file_type": "excel",
+                                    },
+                                })
+                    loaded_rows = len(documents) - before_count
+                    self._emit_progress(
+                        "file_loaded",
+                        file=rel_path,
+                        file_type="excel",
+                        records=loaded_rows,
+                    )
+                elif self._is_supported_source_file(os.path.basename(rel_path)):
+                    with open(
+                        file_path,
+                        "r",
+                        encoding="utf-8",
+                        errors="ignore",
+                    ) as f:
+                        text = f.read()
+                    if text.strip():
+                        documents.append({
+                            "page_content": text,
+                            "metadata": {
+                                "source": rel_path,
+                                "file_type": self._detect_file_type(
+                                    os.path.basename(rel_path)
+                                ),
+                            }
+                        })
+                        self._emit_progress(
+                            "file_loaded",
+                            file=rel_path,
+                            file_type=self._detect_file_type(
+                                os.path.basename(rel_path)
+                            ),
+                            records=1,
+                        )
                     else:
-                        LOGGER.warning("⚠️ Formato no soportado: %s", rel_path)
-                except (
-                    OSError,
-                    ValueError,
-                    PdfReadError,
-                    InvalidFileException,
-                ) as exc:
-                    LOGGER.warning("❌ Error cargando %s: %s", rel_path, exc)
+                        self._emit_progress(
+                            "file_empty",
+                            file=rel_path,
+                        )
+                else:
+                    LOGGER.warning("⚠️ Formato no soportado: %s", rel_path)
+                    self._emit_progress(
+                        "file_unsupported",
+                        file=rel_path,
+                    )
+            except (
+                OSError,
+                ValueError,
+                PdfReadError,
+                InvalidFileException,
+            ) as exc:
+                LOGGER.warning("❌ Error cargando %s: %s", rel_path, exc)
+                self._emit_progress(
+                    "file_error",
+                    file=rel_path,
+                    error=str(exc),
+                )
+
+        self._emit_progress(
+            "load_complete",
+            loaded_documents=len(documents),
+            total_files=total_files,
+        )
         return documents
 
     def run(self, github_url: str | None = None) -> None:
         """Ejecuta la ingesta completa hacia ChromaDB y Neo4j."""
+        self._emit_progress(
+            "run_start",
+            github_url=github_url or "",
+        )
         # 0. Si hay GitHub, descargar primero
         if github_url:
             loader = GitHubLoader(self.data_path)
@@ -684,6 +1217,7 @@ class KDBIngestor:
         raw_docs = self.load_documents()
         if not raw_docs:
             LOGGER.warning("⚠️ No se encontraron documentos para procesar.")
+            self._emit_progress("run_no_documents")
             return
 
         # 2 y 3. Chunking + upsert en una o varias colecciones
@@ -711,6 +1245,14 @@ class KDBIngestor:
             )
             docs = self._chunk_documents(
                 raw_docs, collection_name=profile_name)
+            self._emit_progress(
+                "profile_chunked",
+                profile=profile_name,
+                strategy=self.chunk_strategy,
+                chunks=len(docs),
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+            )
             LOGGER.info(
                 "💾 Guardando %s fragmentos en ChromaDB (%s)...",
                 len(docs),
@@ -753,8 +1295,10 @@ class KDBIngestor:
         # 4. Indexar estructura documental en Neo4j (solo perfil principal para
         # continuidad)
         self._index_graph(graph_docs)
+        self._index_code_graph(raw_docs)
 
         LOGGER.info("✅ Ingesta finalizada exitosamente.")
+        self._emit_progress("run_complete")
         self.close()
 
 

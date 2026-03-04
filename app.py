@@ -22,6 +22,7 @@ import shutil
 import zipfile
 import gc
 import logging
+from datetime import datetime
 
 from typing import Any
 
@@ -281,18 +282,37 @@ neo4j_driver = init_neo4j_driver()
 # initialize OpenAI client (new 1.0+ interface)
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-system_prompt = """Eres un Auditor Técnico experto y Analista de Datos.
-Tu objetivo es analizar la base de conocimientos proporcionada.
+system_prompt = """Eres un agente de investigación profunda especializado en análisis exhaustivos de bases de código y temas.
 
-REGLAS DE ORO:
-1. IDIOMA: Responde siempre en ESPAÑOL profesional.
-2. RIGOR: Si los datos provienen de una tabla,
-    interprétalos con precisión quirúrgica.
-3. CITACIÓN: Menciona siempre el nombre del archivo fuente
-    (p.ej., 'Según reporte_final.pdf, página 4...').
-4. HONESTIDAD: Si no encuentras evidencia explícita en los documentos,
-    di: 'No se encontraron registros suficientes para validar
-    esta información'.
+**Idioma obligatorio:**
+- Responde siempre en español.
+- No uses inglés para encabezados ni secciones.
+- Usa "Resumen" en lugar de "Summary".
+- Si la pregunta viene en inglés, traduce tu respuesta al español.
+
+**Directorio de trabajo:** {{cwd}}
+
+Su función es:
+- Analizar a fondo la estructura, los patrones y las convenciones de la base de código proporcionada.
+- Investigar el tema en profundidad, relacionándolo con la base de código existente.
+- Identificar tecnologías, dependencias y decisiones arquitectónicas relevantes.
+- Identificar restricciones técnicas, riesgos y oportunidades.
+- Presentar hallazgos estructurados con secciones claras.
+
+**Formato de salida:**
+Estructure su respuesta con estas secciones cuando sea relevante:
+- **Resumen**: Resumen general de los hallazgos (2-3 oraciones).
+- **Análisis de la base de código**: Patrones clave, pila tecnológica y convenciones encontradas.
+- **Hallazgos de la investigación**: Hallazgos detallados sobre el tema solicitado.
+- **Restricciones y riesgos**: Limitaciones o riesgos técnicos a considerar.
+- **Recomendaciones**: Próximos pasos prácticos basados ​​en los hallazgos.
+
+**Mejores prácticas:**
+- Usar grep y glob para explorar la base de código sistemáticamente.
+- Leer los archivos reales para comprender los detalles reales de la implementación.
+- Ser específico: citar las rutas de los archivos y los patrones encontrados.
+- Conectar los hallazgos de la investigación con las realidades del código fuente.
+- Priorizar la profundidad y la precisión sobre la amplitud.
 """
 
 
@@ -509,6 +529,8 @@ def generar_respuesta(
 
     prompt = (
         f"{system_prompt}\n\n"
+        "IMPORTANTE: RESPONDE SOLO EN ESPAÑOL. "
+        "NO USES INGLÉS EN TÍTULOS O CONTENIDO.\n\n"
         "VALIDA LA RESPUESTA CON DOS CAPAS:\n"
         "1) Semántica (similitud vectorial)\n"
         "2) Estructural (posición y continuidad del chunk en grafo)\n\n"
@@ -668,6 +690,24 @@ with st.sidebar:
         if files or carpeta_local.strip():
             with st.status("Procesando...", expanded=True) as status:
                 total_copiados = 0
+                log_lines: list[str] = []
+                progress_box = st.empty()
+                detail_box = st.empty()
+                log_box = st.empty()
+
+                def add_log(message: str) -> None:
+                    """Acumula y muestra logs recientes del proceso de ingesta."""
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    log_lines.append(f"[{timestamp}] {message}")
+                    log_box.code(
+                        "\n".join(log_lines[-80:]),
+                        language="text",
+                    )
+
+                progress_box.progress(0, text="Preparando ingesta...")
+                detail_box.info(
+                    "Esperando archivos para iniciar análisis de ingesta..."
+                )
 
                 for f in files or []:
                     if f.name.lower().endswith(".zip"):
@@ -690,16 +730,182 @@ with st.sidebar:
                         f"📁 Carpeta copiada recursivamente ({count} archivos)")
 
                 st.write(f"📚 Archivos listos para indexar: {total_copiados}")
+                add_log(f"Archivos listos para indexar: {total_copiados}")
 
                 st.write(
                     "Analizando contenido y generando embeddings + "
                     "grafo (ChromaDB + Neo4j)..."
                 )
 
+                ingest_state = {
+                    "processed_files": 0,
+                    "total_files": 0,
+                    "inserted": 0,
+                    "failed": 0,
+                    "total_chunks": 0,
+                }
+
+                def on_ingest_event(event: dict[str, Any]) -> None:
+                    """Actualiza barra de progreso y sysout durante ingesta."""
+                    event_type = event.get("event", "")
+
+                    if event_type == "scan_complete":
+                        ingest_state["total_files"] = int(
+                            event.get("total_files", 0)
+                        )
+                        supported = int(event.get("supported_files", 0))
+                        add_log(
+                            "Escaneo completo: "
+                            f"{supported}/{ingest_state['total_files']} "
+                            "archivos soportados"
+                        )
+                        return
+
+                    if event_type == "file_processing":
+                        ingest_state["processed_files"] = int(
+                            event.get("index", 0)
+                        )
+                        total_files = max(1, int(event.get("total_files", 1)))
+                        file_progress = (
+                            ingest_state["processed_files"] / total_files
+                        )
+                        global_progress = min(0.4, file_progress * 0.4)
+                        current_file = event.get("file", "")
+                        progress_box.progress(
+                            int(global_progress * 100),
+                            text=(
+                                "Cargando archivos "
+                                f"({ingest_state['processed_files']}/"
+                                f"{total_files})"
+                            ),
+                        )
+                        detail_box.info(
+                            "Archivo actual: "
+                            f"{current_file} | "
+                            f"Avance carga: {file_progress * 100:.1f}%"
+                        )
+                        add_log(f"Procesando archivo: {current_file}")
+                        return
+
+                    if event_type == "file_unsupported":
+                        add_log(
+                            "Formato no soportado (omitido): "
+                            f"{event.get('file', '')}"
+                        )
+                        return
+
+                    if event_type == "file_error":
+                        add_log(
+                            "Error leyendo archivo: "
+                            f"{event.get('file', '')} | "
+                            f"{event.get('error', '')}"
+                        )
+                        return
+
+                    if event_type == "profile_chunked":
+                        add_log(
+                            "Chunking perfil="
+                            f"{event.get('profile', '')} "
+                            f"estrategia={event.get('strategy', '')} "
+                            f"chunks={event.get('chunks', 0)} "
+                            f"chunk_size={event.get('chunk_size', 0)} "
+                            f"overlap={event.get('chunk_overlap', 0)}"
+                        )
+                        detail_box.info(
+                            "Perfil activo: "
+                            f"{event.get('profile', '')} | "
+                            f"Estrategia: {event.get('strategy', '')} | "
+                            f"Chunk size: {event.get('chunk_size', 0)} | "
+                            f"Overlap: {event.get('chunk_overlap', 0)}"
+                        )
+                        return
+
+                    if event_type == "upsert_start":
+                        ingest_state["total_chunks"] = int(
+                            event.get("total_chunks", 0)
+                        )
+                        add_log(
+                            "Upsert iniciado: "
+                            f"chunks={ingest_state['total_chunks']} "
+                            f"max_batch_tokens={event.get('max_batch_tokens', 0)} "
+                            f"max_batch_chars={event.get('max_batch_chars', 0)}"
+                        )
+                        return
+
+                    if event_type == "upsert_batch_result":
+                        ingest_state["inserted"] = int(event.get("inserted", 0))
+                        ingest_state["failed"] = int(event.get("failed", 0))
+                        ingest_state["total_chunks"] = int(
+                            event.get("total_chunks", 0)
+                        )
+
+                        upsert_progress = float(event.get("progress", 0.0))
+                        global_progress = min(0.95, 0.4 + upsert_progress * 0.55)
+                        progress_box.progress(
+                            int(global_progress * 100),
+                            text=(
+                                "Insertando embeddings "
+                                f"({upsert_progress * 100:.1f}%)"
+                            ),
+                        )
+                        detail_box.info(
+                            "Chunks OK: "
+                            f"{ingest_state['inserted']} | "
+                            "Chunks fallo: "
+                            f"{ingest_state['failed']} | "
+                            "Total chunks: "
+                            f"{ingest_state['total_chunks']}"
+                        )
+                        add_log(
+                            "Batch resultado: "
+                            f"size={event.get('batch_size', 0)} "
+                            f"tokens={event.get('batch_tokens', 0)} "
+                            f"chars={event.get('batch_chars', 0)} "
+                            f"ok={ingest_state['inserted']} "
+                            f"fail={ingest_state['failed']}"
+                        )
+                        return
+
+                    if event_type == "upsert_bad_request":
+                        add_log(
+                            "BadRequestError: "
+                            f"batch_size={event.get('batch_size', 0)} "
+                            f"sample_id={event.get('sample_id', '')}"
+                        )
+                        return
+
+                    if event_type == "upsert_split_batch":
+                        add_log(
+                            "Split batch por BadRequestError: "
+                            f"batch_size={event.get('batch_size', 0)} "
+                            f"depth={event.get('depth', 0)}"
+                        )
+                        return
+
+                    if event_type == "upsert_end":
+                        add_log(
+                            "Upsert finalizado: "
+                            f"inserted={event.get('inserted', 0)} "
+                            f"failed={event.get('failed', 0)}"
+                        )
+                        return
+
+                    if event_type == "run_no_documents":
+                        add_log("No se encontraron documentos para procesar")
+                        return
+
+                    if event_type == "run_complete":
+                        progress_box.progress(100, text="Ingesta completada")
+                        add_log("Ingesta finalizada exitosamente")
+
                 # Pasar cliente ChromaDB en caché para evitar múltiples
                 # instancias
                 ingestor = KDBIngestor(
-                    DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
+                    DATA_PATH,
+                    CHROMA_PATH,
+                    chroma_client=chroma_client,
+                    progress_callback=on_ingest_event,
+                )
                 ingestor.run()
 
                 status.update(label="✅ KDB Actualizada", state="complete")
