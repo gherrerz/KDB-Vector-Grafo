@@ -1,41 +1,43 @@
-Actúa como desarrollador senior Python y crea un sistema de auditoría documental con RAG híbrido.
+Actúa como desarrollador senior Python y mantén este sistema de auditoría documental con RAG híbrido.
 
 Objetivo:
-Construir una app en Streamlit que permita subir PDFs/Excels, indexar semánticamente en ChromaDB y estructuralmente en Neo4j, y responder consultas con evidencia combinada.
+Conservar y extender una app en Streamlit que indexa evidencia en ChromaDB y Neo4j, y responde consultas técnicas en español usando recuperación híbrida y trazabilidad de fuentes.
 
-Requisitos técnicos:
+Requisitos técnicos vigentes:
 - Python 3.10+
-- pydantic>=1.10.0,<2.0.0
-- chromadb==0.4.22
+- pydantic>=2.0.0
+- chromadb>=0.5.0
 - openai>=1.0.0
 - neo4j>=5.0.0
-- streamlit
-- pypdf
-- openpyxl
-- python-dotenv
+- streamlit>=1.18.1
+- pypdf>=3.0.0
+- openpyxl>=3.0.10
+- unstructured[all-docs]>=0.6.1
+- python-dotenv>=0.21.0
 
-Arquitectura requerida:
+Arquitectura vigente:
 1) ingestion.py
-- Crear clase KDBIngestor(data_path, db_path)
-- Cargar .pdf, .xlsx, .xls desde ./documentos_fuente
-- Dividir texto en chunks con overlap
-- Indexar en ChromaDB colección kdb_principal
-- Crear grafo en Neo4j:
-  - (:Document {name})
-  - (:Chunk {id, text, position, source})
-  - (Document)-[:HAS_CHUNK]->(Chunk)
-  - (Chunk)-[:NEXT]->(Chunk)
-- Si Neo4j no está configurado, continuar en modo vectorial sin fallar
+- Clase `KDBIngestor(data_path, db_path, chroma_client=None, progress_callback=None)`.
+- Carga archivos de `./documentos_fuente` (PDF, Excel, texto, config y código).
+- Chunking por perfiles/estrategia (small/large/code) con límites por tokens y caracteres.
+- Upsert robusto con split recursivo de lotes/chunks cuando hay `BadRequestError`.
+- Indexación en ChromaDB multi-colección (`kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
+- Indexación en Neo4j:
+  - Continuidad documental: `(:Document)-[:HAS_CHUNK]->(:Chunk)-[:NEXT]->(:Chunk)`
+  - Grafo de código: `(:CodeFile)-[:DECLARES]->(:CodeEntity)` y `(:CodeEntity)-[:DEPENDS_ON]->(:CodeEntity)`
+- Si Neo4j no está configurado, continuar en modo vectorial sin fallar.
+- Emisión de eventos de progreso para UI (`scan_complete`, `file_processing`, `profile_chunked`, `upsert_*`, `run_complete`).
 
 2) app.py
-- Streamlit con sidebar para subir archivos
-- Botón “Indexar Nueva Evidencia” que ejecute KDBIngestor
-- Consulta híbrida:
-  - consultar_evidencia_kdb(query): top-k semántico
-  - consultar_evidencia_grafo(query): búsqueda por keywords + continuidad prev/next
-  - combinar resultados en prompt final
-- Llamar API OpenAI (cliente v1) con model gpt-4o y temperature=0
-- Responder en español técnico, citar fuentes, y declarar falta de evidencia cuando aplique
+- Sidebar para carga de archivos, ZIP o carpeta local y para indexado desde URL GitHub.
+- Botones de limpieza normal y limpieza profunda de índices.
+- Recuperación híbrida:
+  - Stage 1: recuperación de alta cobertura por intención y expansiones de consulta.
+  - Stage 2: reranking MMR (relevancia + diversidad) con métricas de diagnóstico.
+  - Evidencia estructural desde Neo4j con keywords y continuidad `prev/next`.
+- Combinar evidencia vectorial + estructural para construir el prompt final.
+- Llamar OpenAI Chat Completions (cliente v1) con `gpt-4o`, `temperature=0`.
+- Responder siempre en español técnico, citando fuentes y declarando falta de evidencia cuando aplique.
 
 Variables de entorno esperadas:
 OPENAI_API_KEY
@@ -46,7 +48,7 @@ NEO4J_PASSWORD
 NEO4J_DATABASE
 
 Criterios de calidad:
-- Manejo de errores robusto
-- Código simple, sin LangChain/LangGraph
-- Compatibilidad Windows
-- Documentación de ejecución en readme.md
+- Manejo de errores robusto y trazable.
+- Código simple, sin LangChain/LangGraph.
+- Compatibilidad Windows.
+- Evitar código muerto y mantener documentación sincronizada con cambios de arquitectura.

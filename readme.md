@@ -15,26 +15,27 @@ El sistema responde en español, cita fuentes y mantiene trazabilidad basada en 
 
 ---
 
-## Estado actual del proyecto (3-mar-2026)
+## Estado actual del proyecto (4-mar-2026)
 
 Breve resumen:
 
-- La aplicación Streamlit arranca localmente y la UI está disponible (ej. http://localhost:8503).
-- Se actualizaron dependencias y se añadieron utilidades para compatibilidad con Python 3.14, además de parches temporales aplicados en el `venv` para `chromadb`/`pydantic`.
-- Se implementó la capacidad de clonar repositorios GitHub y limpiarlos antes de indexar (`scripts/github_loader.py`).
+- La aplicación Streamlit opera de forma estable en entorno local.
+- La búsqueda híbrida usa un pipeline vectorial en 2 etapas (recall + reranking) y validación estructural con Neo4j.
+- La ingesta reporta progreso en vivo (escaneo, chunking, batches, errores BadRequest y cierre).
 
 Cambios y mejoras relevantes:
 
-- `requirements.txt` actualizado (pydantic >=2, chromadb >=0.5.0, GitPython instalado).
 - `app.py`:
-  - `@st.cache_resource` en inicializadores de ChromaDB y Neo4j para evitar reinicios y conflictos de instancias.
-  - Correcciones en rutas y variables (`DATA_PATH`, `CHROMA_PATH`).
-  - Integración con el ingestor para reusar el cliente Chroma en caché.
+  - Retrieval en 2 etapas: Stage 1 de alta cobertura por intención y Stage 2 con reranking MMR (relevancia + diversidad).
+  - Clasificación de intención (`listing`, `counting`, `impact_analysis`, `bug_rootcause`, `architecture`, `security`, `performance`, `refactor_plan`).
+  - Diagnóstico de consulta en UI: `intent`, `stage1_k`, `stage1_raw`, `stage1_deduped`, `stage2_scored`, `stage2_final`, `stage2_mmr_lambda`.
+  - Respuestas forzadas en español en el prompt de sistema.
 - `ingestion.py`:
-  - `KDBIngestor.__init__` ahora acepta un `chroma_client` opcional.
-  - `run(github_url=...)` soporta descarga y limpieza de repositorios antes de indexar.
-- `scripts/github_loader.py`: nuevo loader para clonar y filtrar repositorios.
-- `pydantic_patch.py`: parche temporal para mitigar errores de inferencia de `pydantic` en Python 3.14 (se aplicó localmente para permitir ejecución).
+  - Ingesta robusta con guardas por tokens/caracteres y split recursivo en lotes para evitar overflow de embeddings.
+  - Emisión de eventos de progreso para trazabilidad operativa de la indexación.
+  - Indexación combinada en Chroma + Neo4j (continuidad documental y entidades/calls de código para análisis de dependencia).
+- `scripts/github_loader.py`:
+  - Carga de repositorios GitHub con limpieza de artefactos no relevantes previo a indexación.
 
 Notas importantes sobre compatibilidad y seguridad:
 
@@ -45,11 +46,12 @@ Notas importantes sobre compatibilidad y seguridad:
 
 ## ✅ Funcionalidades
 
-- Ingesta de documentos `.pdf`, `.xlsx`, `.xls` y ficheros de texto/código.
-- Indexación semántica con ChromaDB (múltiples colecciones: `kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
-- Indexación estructural en Neo4j (Document -> Chunk -> NEXT).
-- Ingesta recursiva de carpetas y clonación de repositorios GitHub para indexado.
-- Consulta híbrida (semántica + estructural) y generación de respuestas con OpenAI.
+- Ingesta de documentos `.pdf`, `.xlsx`, `.xls` y archivos de texto/código/config.
+- Indexación semántica multi-colección en ChromaDB (`kdb_principal`, `kdb_small`, `kdb_large`, `kdb_code`).
+- Indexación estructural en Neo4j (`Document -> Chunk -> NEXT`) y grafo de entidades de código (`CodeFile`, `CodeEntity`, `DEPENDS_ON`).
+- Ingesta recursiva desde carpeta local o repositorio GitHub.
+- Consulta híbrida: Stage 1 (recall alto) + Stage 2 (MMR), combinada con evidencia estructural.
+- Telemetría de ingesta en UI (progreso, archivo actual, chunks insertados/fallidos, batches divididos).
 
 ---
 
@@ -66,7 +68,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_neo4j.ps1 -Password "Tu
 python -m streamlit run app.py
 ```
 
-La app mostrará la URL local en la consola de Streamlit (ej. `http://localhost:8503`).
+La app mostrará la URL local en la consola de Streamlit (normalmente `http://localhost:8501`, salvo que el puerto esté ocupado).
 
 ---
 
@@ -86,6 +88,9 @@ La app mostrará la URL local en la consola de Streamlit (ej. `http://localhost:
 - `openai>=1.0.0`
 - `neo4j>=5.0.0`
 - `streamlit>=1.18.1`
+- `unstructured[all-docs]>=0.6.1`
+- `pypdf>=3.0.0`
+- `openpyxl>=3.0.10`
 
 ---
 
@@ -105,7 +110,7 @@ La app mostrará la URL local en la consola de Streamlit (ej. `http://localhost:
 
 ## 🧪 Calidad técnica (Checklist antes/después)
 
-Fecha de corte: **3-mar-2026**
+Fecha de corte: **4-mar-2026**
 
 ### Antes
 
