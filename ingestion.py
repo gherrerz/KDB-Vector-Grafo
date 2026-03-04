@@ -10,16 +10,19 @@ from pathlib import Path
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
+from importlib_metadata import metadata
 from neo4j import GraphDatabase
 from neo4j import Driver
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from scripts.github_loader import GitHubLoader
+from confluence_loader import ConfluenceLoader  # Loader para Confluence
 
 # simple loaders to avoid langchain_community
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 import openpyxl
 from openpyxl.utils.exceptions import InvalidFileException
+
 
 # Cargar variables de entorno (API KEY)
 load_dotenv()
@@ -794,6 +797,9 @@ class KDBIngestor:
         source = (metadata.get("source", "") or "").lower()
         ext = os.path.splitext(source)[1]
 
+        if metadata.get("file_type") == "confluence":
+            return "sentence_window" # O la que prefieras para docs de texto
+
         if collection_name == "kdb_code" or file_type == "code":
             return "code_aware"
 
@@ -1419,11 +1425,19 @@ class KDBIngestor:
         )
         return documents
 
-    def run(self, github_url: str | None = None) -> None:
-        """Ejecuta la ingesta completa hacia ChromaDB y Neo4j."""
+    def run(self, github_url: str | None = None, extra_docs: list[dict] | None = None) -> None:
+        """
+        Ejecuta la ingesta completa hacia ChromaDB y Neo4j.
+        
+        Parameters:
+        github_url (str | None): URL del repositorio GitHub a descargar (opcional).
+        extra_docs (list[dict] | None): Lista de documentos externos (ej: Confluence) 
+                                        con estructura {"page_content": str, "metadata": dict}
+        """
         self._emit_progress(
             "run_start",
             github_url=github_url or "",
+            extra_docs_count=len(extra_docs) if extra_docs else 0,
         )
         # 0. Si hay GitHub, descargar primero
         if github_url:
@@ -1435,6 +1449,17 @@ class KDBIngestor:
                 return
         # 1. Cargar documentos
         raw_docs = self.load_documents()
+        
+        # 1b. Agregar documentos externos (Confluence, etc.) si se proporcionan
+        if extra_docs:
+            LOGGER.info(f"📋 Agregando {len(extra_docs)} documentos externos (Confluence)...")
+            raw_docs.extend(extra_docs)
+            self._emit_progress(
+                "external_docs_added",
+                external_docs_count=len(extra_docs),
+                total_docs=len(raw_docs),
+            )
+        
         if not raw_docs:
             LOGGER.warning("⚠️ No se encontraron documentos para procesar.")
             self._emit_progress("run_no_documents")

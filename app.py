@@ -26,6 +26,7 @@ from datetime import datetime
 
 from typing import Any
 
+from confluence_loader import ConfluenceLoader
 from ingestion import KDBIngestor
 from dotenv import load_dotenv
 
@@ -1025,6 +1026,25 @@ with st.sidebar:
                     st.error(f"Detalles: {e}")
         else:
             st.warning("Por favor, introduce una URL válida.")
+    st.divider()
+    st.subheader("📋 Conexión Confluence")
+    conf_url = st.text_input("URL (ej: https://empresa.atlassian.net)")
+    conf_space = st.text_input("Space Key (ej: KDBDOC)")
+    
+    if st.button("🔗 Sincronizar Confluence"):
+        # El API Token se suele guardar en .env por seguridad
+        api_token = os.getenv("CONFLUENCE_API_TOKEN")
+        user = os.getenv("CONFLUENCE_USER")
+        
+        loader = ConfluenceLoader(conf_url, user, api_token)
+        with st.spinner("Leyendo páginas de Confluence..."):
+            conf_docs = loader.fetch_space_content(conf_space)
+            
+            # Inyectamos directamente en el ingestor
+            ingestor = KDBIngestor(DATA_PATH, CHROMA_PATH, chroma_client=chroma_client)
+            # Modificamos run() para aceptar una lista de documentos externos
+            ingestor.run(extra_docs=conf_docs)
+            st.success(f"¡{len(conf_docs)} páginas indexadas!")
     st.divider()
     st.header("📥 Ingesta de Evidencia")
     if neo4j_driver is None:
